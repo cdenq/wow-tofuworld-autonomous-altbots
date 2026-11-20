@@ -1,9 +1,11 @@
 [worldserver]
 
+# mod-autonomous-altbots, Tofu fork (branch tofu).
 # Requires:
-#   EnablePlayerSettings = 1
-#   AiPlayerbot.DisabledWithoutRealPlayer = 0
-# See README.md before enabling characters.
+#   EnablePlayerSettings = 1 in worldserver.conf
+#   the Tofu fork of mod-playerbots (https://github.com/cdenq/wow-tofuworld-playerbots, branch tofu)
+# Works with any value of Playerbots.DisabledWithoutRealPlayer: this module enforces its own rule that autonomous alts
+# are online only while at least one real player is in the world.
 
 # Enable persistent autonomous altbots.
 AutonomousAltBots.Enable = 1
@@ -11,17 +13,33 @@ AutonomousAltBots.Enable = 1
 # Delay automatic logins after world startup so normal server initialization can settle.
 AutonomousAltBots.StartupDelaySeconds = 30
 
-# How often to retry offline bots and restore their autonomous strategies.
+# How often to check: log in enabled alts (only while a real player is in the world) and restore their strategies.
 AutonomousAltBots.CheckIntervalSeconds = 10
 
-# Strategy controls. These characters keep their normal class, quest, loot, gear, and progression data.
+# Log out every autonomous alt this many seconds after the last real player leaves the world.
+AutonomousAltBots.NoPlayerLogoutDelaySeconds = 60
+
+# Strategies while playing on its own. Characters keep their normal class, quest, loot, gear, and progression data.
 AutonomousAltBots.Strategy.Quest = 1
 AutonomousAltBots.Strategy.Grind = 1
 AutonomousAltBots.Strategy.NewRpg = 1
 
-# When enabled, the bot remains independent instead of following a real-player master after login. Disable this if
-# autonomous alts should resume normal master/follow behaviour when grouped with a real player.
-AutonomousAltBots.Independent = 1
+# On level-up:
+#   TeleportForLevel   - move to a zone that fits the new level (never to a city, so the hearthstone is not changed)
+#   LearnTrainerSpells - learn class-trainer spells and pay the trainer cost (also once at each login);
+#                        never profession recipes, riding, or weapon skills; spells it cannot afford wait for later
+#   AutoTalents        - spend new talent points in the character's current tree (a character with no points
+#                        spent yet gets a random tree, so spend the first point yourself)
+AutonomousAltBots.LevelUp.TeleportForLevel = 1
+AutonomousAltBots.LevelUp.LearnTrainerSpells = 1
+AutonomousAltBots.LevelUp.AutoTalents = 1
 
-# Log autonomous login and strategy activity to the worldserver log.
-AutonomousAltBots.VerboseLogging = 1
+# Ammo restocking for hunters: when ammo drops below AmmoThreshold and the character can afford ammo, it walks to the
+# nearest friendly ammo vendor on the same map within VendorSearchDistance yards and buys with its own gold. Without
+# gold it keeps grinding and tries again later. (Food and drink are covered by Playerbots.BotCheats "food".)
+AutonomousAltBots.Restock.Enable = 1
+AutonomousAltBots.Restock.AmmoThreshold = 200
+AutonomousAltBots.Restock.VendorSearchDistance = 3000
+
+# Extra detail in the worldserver log.
+AutonomousAltBots.VerboseLogging = 0

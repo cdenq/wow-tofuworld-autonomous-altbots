@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.1] - 2026-11-19 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Replaced both integration patches with the Tofu fork of mod-playerbots (`TofuAutonomousAlt.h`); the core is no longer patched. Built against mod-playerbots ecc4a53 and the Playerbot core fork at 32fd347.
+- Autonomous alts log in only while at least one real player is in the world and log out `NoPlayerLogoutDelaySeconds` after the last one leaves, whatever `Playerbots.DisabledWithoutRealPlayer` is set to.
+- Commands are player level: players manage characters on their own account; GMs and the console manage any character. `.autoalt reload` stays GM only.
+- While grouped with a real player who may control it, the alt follows that player and takes commands; it resumes on its own when the player leaves or logs out. `AutonomousAltBots.Independent` is removed.
+- Level-up behaviour (paid class-trainer spells, automatic talents, teleport to a zone for the new level) and hunter ammo restocking are provided by the playerbots fork and configured here (`LevelUp.*`, `Restock.*`).
+- Fixed: upstream 1.0.1 does not compile against mod-playerbots ecc4a53 (`PlayerbotAI::IsRealPlayer()` no longer exists).
+- Removed the patch installers and the upstream CI workflow, which builds against upstream mod-playerbots.
+
 ## [Unreleased]
 
 ### Changed

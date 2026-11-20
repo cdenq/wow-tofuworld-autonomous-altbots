@@ -1,3 +1,17 @@
+# mod-autonomous-altbots (Tofu Worldview fork)
+
+This is the `tofu` branch, a fork of [Gutwormy/mod-autonomous-altbots](https://github.com/Gutwormy/mod-autonomous-altbots) 1.0.1 for the Tofu Worldview server. Everything below the line describes upstream; where it disagrees with this section, this section wins.
+
+- **Requires** the Tofu fork of mod-playerbots: https://github.com/cdenq/wow-tofuworld-playerbots, branch `tofu` (based on mod-playerbots ecc4a53). It provides `TofuAutonomousAlt.h`. No core patch and no patch installer.
+- **Online only with players:** autonomous alts log in only while at least one real player is in the world, and log out `AutonomousAltBots.NoPlayerLogoutDelaySeconds` (60) after the last one leaves. `Playerbots.DisabledWithoutRealPlayer` can stay 1.
+- **Commands** (`.autoalt start|stop|status|list <name>`) work for players on characters of their own account; GMs and the console can manage any character. `.autoalt reload` is GM only.
+- **Grouping:** a real player who may control the alt (same account, same guild if `Playerbots.AllowGuildBots`, a linked account, or a GM) can invite it; it follows and takes commands like an altbot, then goes back to playing on its own after the player leaves or logs out. Other invites are declined.
+- **On level-up** (playerbots fork): learns class-trainer spells and pays the trainer cost, spends talent points in its current tree, and teleports to a zone for its new level (never a city). Class quest spells are granted as for random bots.
+- **Hunter ammo:** below `AutonomousAltBots.Restock.AmmoThreshold`, a hunter that can afford ammo walks to the nearest friendly ammo vendor on its map and buys with its own gold; without gold it keeps grinding.
+- **Data safety:** enrolled alts are never in the random bot pool, so the random-bot randomize step (which empties bags) never runs on them.
+
+---
+
 # mod-autonomous-altbots
 
 Persistent, independently active alt characters for the AzerothCore Playerbots branch.
