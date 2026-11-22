@@ -41,5 +41,18 @@ AutonomousAltBots.Restock.Enable = 1
 AutonomousAltBots.Restock.AmmoThreshold = 200
 AutonomousAltBots.Restock.VendorSearchDistance = 3000
 
+# Challenge modes, read from the character's player settings under SettingSource (mod-challenge-modes). Indexes match
+# mod-challenge-modes (-1 turns that check off). A challenge counts only below DisableLevel; the dead flag at any level.
+#   Quest Only - the alt does not use the grind strategy (kill XP is 0 for it), so it spends its time on quests
+#   Hardcore   - the alt cannot be turned on while Hardcore is active, unless AllowHardcore = 1
+#   Dead flag  - a character that died on Hardcore is never logged in; an autonomous alt that dies on Hardcore is
+#                turned off and logged out at once, even with AllowHardcore = 1
+AutonomousAltBots.Challenge.SettingSource = "mod-challenge-modes"
+AutonomousAltBots.Challenge.HardcoreIndex = 0
+AutonomousAltBots.Challenge.HardcoreDeadIndex = 8
+AutonomousAltBots.Challenge.QuestOnlyIndex = 6
+AutonomousAltBots.Challenge.DisableLevel = 80
+AutonomousAltBots.Challenge.AllowHardcore = 0
+
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0

@@ -11,6 +11,9 @@
  * - Players manage characters on their own account; GMs and the console manage any character.
  * - While grouped with a real player, the alt is left alone so it follows that player; it resumes on its own after.
  * - Level-up behaviour (paid class spells, talents, zone teleport) and ammo restocking live in mod-playerbots.
+ * - Challenge modes (read from the character's mod-challenge-modes settings): Quest Only alts do not use the grind
+ *   strategy; Hardcore alts cannot be turned on (unless AllowHardcore), and a Hardcore alt that dies, or a character
+ *   flagged dead, is turned off and logged out for good.
  */
 
 #include "AccountMgr.h"
@@ -36,6 +39,7 @@
 #include "WorldSessionMgr.h"
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,7 +50,7 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr char SETTING_SOURCE[] = "mod_autonomous_altbots";
-constexpr char MODULE_VERSION[] = "1.0.1-tofu.1";
+constexpr char MODULE_VERSION[] = "1.0.1-tofu.2";
 constexpr uint32 SETTING_ENABLED = 0;
 constexpr uint32 STOP_WATCH_DURATION_MS = 30000;
 
@@ -60,6 +64,14 @@ struct AutonomousAltConfig
     bool grind = true;
     bool newRpg = true;
     bool verboseLogging = false;
+
+    // Challenge modes: indexes in the character's player settings under challengeSource (mod-challenge-modes), -1 = off.
+    std::string challengeSource = "mod-challenge-modes";
+    int32 hardcoreIndex = 0;
+    int32 hardcoreDeadIndex = 8;
+    int32 questOnlyIndex = 6;
+    uint32 challengeDisableLevel = 80;  // challenges end at this level (ChallengeModes DisableLevel)
+    bool allowHardcore = false;
 };
 
 AutonomousAltConfig g_Config;
@@ -70,6 +82,10 @@ uint32 g_StartupElapsed = 0;
 uint32 g_CheckElapsed = 0;
 uint32 g_NoPlayerElapsed = 0;
 bool g_StartupComplete = false;
+
+// Hardcore alts that died since the last update (filled from map threads, handled on the world thread).
+std::mutex g_PendingDeathsMutex;
+std::unordered_set<ObjectGuid::LowType> g_PendingHardcoreDeaths;
 
 bool PlayerSettingsEnabled()
 {
@@ -90,6 +106,14 @@ void LoadConfig()
     g_Config.grind = sConfigMgr->GetOption<bool>("AutonomousAltBots.Strategy.Grind", true);
     g_Config.newRpg = sConfigMgr->GetOption<bool>("AutonomousAltBots.Strategy.NewRpg", true);
     g_Config.verboseLogging = sConfigMgr->GetOption<bool>("AutonomousAltBots.VerboseLogging", false);
+
+    g_Config.challengeSource =
+        sConfigMgr->GetOption<std::string>("AutonomousAltBots.Challenge.SettingSource", "mod-challenge-modes");
+    g_Config.hardcoreIndex = sConfigMgr->GetOption<int32>("AutonomousAltBots.Challenge.HardcoreIndex", 0);
+    g_Config.hardcoreDeadIndex = sConfigMgr->GetOption<int32>("AutonomousAltBots.Challenge.HardcoreDeadIndex", 8);
+    g_Config.questOnlyIndex = sConfigMgr->GetOption<int32>("AutonomousAltBots.Challenge.QuestOnlyIndex", 6);
+    g_Config.challengeDisableLevel = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Challenge.DisableLevel", 80);
+    g_Config.allowHardcore = sConfigMgr->GetOption<bool>("AutonomousAltBots.Challenge.AllowHardcore", false);
 
     TofuAutonomousAlt::Settings settings;
     settings.teleportForLevel = sConfigMgr->GetOption<bool>("AutonomousAltBots.LevelUp.TeleportForLevel", true);
@@ -183,7 +207,66 @@ void LogoutAutonomousBot(ObjectGuid guid)
         sRandomPlayerbotMgr.LogoutPlayerBot(guid);
 }
 
-void ApplyAutonomousStrategies(Player* bot)
+// Challenge state of a character, from its mod-challenge-modes player settings. A challenge counts only below the
+// level where mod-challenge-modes turns it off; the dead flag counts at any level.
+struct ChallengeState
+{
+    bool hardcore = false;
+    bool hardcoreDead = false;
+    bool questOnly = false;
+};
+
+ChallengeState MakeChallengeState(PlayerSettingVector const& settings, uint8 level)
+{
+    auto isOn = [&settings](int32 index)
+    { return index >= 0 && static_cast<size_t>(index) < settings.size() && settings[index].value != 0; };
+
+    ChallengeState state;
+    bool const active = level < g_Config.challengeDisableLevel;
+    state.hardcore = active && isOn(g_Config.hardcoreIndex);
+    state.hardcoreDead = isOn(g_Config.hardcoreDeadIndex);
+    state.questOnly = active && isOn(g_Config.questOnlyIndex);
+    return state;
+}
+
+ChallengeState GetChallengeState(Player* player)
+{
+    if (!player || g_Config.challengeSource.empty())
+        return {};
+
+    int32 const highest = std::max({g_Config.hardcoreIndex, g_Config.hardcoreDeadIndex, g_Config.questOnlyIndex});
+    PlayerSettingVector settings;
+    for (int32 index = 0; index <= highest; ++index)
+        settings.push_back(player->GetPlayerSetting(g_Config.challengeSource, index));
+
+    return MakeChallengeState(settings, player->GetLevel());
+}
+
+// For a character that is not online: its saved settings row.
+ChallengeState GetOfflineChallengeState(ObjectGuid guid)
+{
+    if (g_Config.challengeSource.empty())
+        return {};
+
+    PlayerSettingVector settings;
+    if (QueryResult result = CharacterDatabase.Query("SELECT data FROM character_settings WHERE guid = {} AND source = '{}'",
+                                                     guid.GetCounter(), g_Config.challengeSource))
+        settings = PlayerSettingsStore::ParseSettingsData(result->Fetch()[0].Get<std::string>());
+
+    return MakeChallengeState(settings, sCharacterCache->GetCharacterLevelByGuid(guid));
+}
+
+// Why this character may not play on its own, or nullptr when it may.
+char const* ChallengeBlockReason(ChallengeState const& state)
+{
+    if (state.hardcoreDead)
+        return "has died on the Hardcore challenge";
+    if (state.hardcore && !g_Config.allowHardcore)
+        return "is on the Hardcore challenge";
+    return nullptr;
+}
+
+void ApplyAutonomousStrategies(Player* bot, bool questOnly)
 {
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (!botAI)
@@ -203,8 +286,12 @@ void ApplyAutonomousStrategies(Player* bot)
     if (g_Config.quest && !botAI->HasStrategy("quest", BOT_STATE_NON_COMBAT))
         botAI->ChangeStrategy("+quest", BOT_STATE_NON_COMBAT);
 
-    if (g_Config.grind && !botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT))
+    // Quest Only earns no kill XP, so a Quest Only alt spends its time on quests instead of grinding.
+    bool const grind = g_Config.grind && !questOnly;
+    if (grind && !botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT))
         botAI->ChangeStrategy("+grind", BOT_STATE_NON_COMBAT);
+    else if (!grind && botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("-grind", BOT_STATE_NON_COMBAT);
 
     if (g_Config.newRpg && !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
         botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
@@ -244,6 +331,15 @@ void SetDesired(ObjectGuid guid, bool enabled)
         g_StopWatchElapsed[guid.GetCounter()] = 0;
         LogoutAutonomousBot(guid);
     }
+}
+
+// Turns a character off for good because of its challenge state (Hardcore, or died on Hardcore).
+void TurnOffForChallenge(ObjectGuid guid, char const* reason)
+{
+    std::string name;
+    sCharacterCache->GetCharacterNameByGuid(guid, name);
+    LOG_INFO("module", "mod-autonomous-altbots: {} {}; turned off and logged out", name, reason);
+    SetDesired(guid, false);
 }
 
 bool IsConsoleOrGM(ChatHandler* handler)
@@ -329,6 +425,7 @@ public:
     void OnUpdate(uint32 diff) override
     {
         ProcessStopWatch(diff);
+        ProcessHardcoreDeaths();
 
         if (!g_Config.enabled || !PlayerSettingsEnabled())
             return;
@@ -355,6 +452,9 @@ public:
 
         bool const logoutAll = !playerOnline && g_NoPlayerElapsed >= g_Config.noPlayerLogoutDelayMs;
 
+        // Turned off after the loop, because turning off changes g_DesiredBots.
+        std::vector<std::pair<ObjectGuid, char const*>> turnOff;
+
         for (ObjectGuid::LowType lowGuid : g_DesiredBots)
         {
             ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(lowGuid);
@@ -366,8 +466,17 @@ public:
                 TofuAutonomousAlt::ClearBotState(lowGuid);
 
                 // Never log in while no real player is in the world.
-                if (playerOnline)
-                    sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+                if (!playerOnline)
+                    continue;
+
+                // A Hardcore or dead Hardcore character never logs in as an autonomous alt.
+                if (char const* reason = ChallengeBlockReason(GetOfflineChallengeState(guid)))
+                {
+                    turnOff.emplace_back(guid, reason);
+                    continue;
+                }
+
+                sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
                 continue;
             }
 
@@ -385,11 +494,36 @@ public:
                 continue;
             }
 
-            ApplyAutonomousStrategies(connected);
+            ChallengeState const state = GetChallengeState(connected);
+            if (char const* reason = ChallengeBlockReason(state))
+            {
+                turnOff.emplace_back(guid, reason);
+                continue;
+            }
+
+            ApplyAutonomousStrategies(connected, state.questOnly);
         }
+
+        for (auto const& [guid, reason] : turnOff)
+            TurnOffForChallenge(guid, reason);
     }
 
 private:
+    // A Hardcore alt that died is logged out before it can release and be resurrected (which mod-challenge-modes
+    // answers with a kill and a kick, and which would repeat at every login).
+    void ProcessHardcoreDeaths()
+    {
+        std::unordered_set<ObjectGuid::LowType> deaths;
+        {
+            std::lock_guard lock(g_PendingDeathsMutex);
+            deaths.swap(g_PendingHardcoreDeaths);
+        }
+
+        for (ObjectGuid::LowType lowGuid : deaths)
+            if (g_DesiredBots.contains(lowGuid))
+                TurnOffForChallenge(ObjectGuid::Create<HighGuid::Player>(lowGuid), "died on the Hardcore challenge");
+    }
+
     void ProcessStopWatch(uint32 diff)
     {
         for (auto itr = g_StopWatchElapsed.begin(); itr != g_StopWatchElapsed.end();)
@@ -410,6 +544,25 @@ private:
             else
                 ++itr;
         }
+    }
+};
+
+class AutonomousAltBotsPlayerScript : public PlayerScript
+{
+public:
+    AutonomousAltBotsPlayerScript() : PlayerScript("AutonomousAltBotsPlayerScript", { PLAYERHOOK_ON_PLAYER_JUST_DIED }) { }
+
+    // Runs on map threads: only reads the thread-safe registry and queues the character for the world thread.
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (!player || !TofuAutonomousAlt::IsEnabled(player->GetGUID().GetCounter()) || !IsPlayerbot(player))
+            return;
+
+        if (!GetChallengeState(player).hardcore)
+            return;
+
+        std::lock_guard lock(g_PendingDeathsMutex);
+        g_PendingHardcoreDeaths.insert(player->GetGUID().GetCounter());
     }
 };
 
@@ -459,9 +612,17 @@ public:
             return false;
         }
 
-        if (Player* connected = FindConnectedCharacter(guid); connected && !IsPlayerbot(connected))
+        Player* connected = FindConnectedCharacter(guid);
+        if (connected && !IsPlayerbot(connected))
         {
             handler->PSendSysMessage("{} is logged in as a player. Log that character out before turning it on.", name);
+            return false;
+        }
+
+        ChallengeState const state = connected ? GetChallengeState(connected) : GetOfflineChallengeState(guid);
+        if (char const* reason = ChallengeBlockReason(state))
+        {
+            handler->PSendSysMessage("{} {} and cannot play on its own.", name, reason);
             return false;
         }
 
@@ -531,5 +692,6 @@ public:
 void Addmod_autonomous_altbotsScripts()
 {
     new AutonomousAltBotsWorldScript();
+    new AutonomousAltBotsPlayerScript();
     new AutonomousAltBotsCommandScript();
 }

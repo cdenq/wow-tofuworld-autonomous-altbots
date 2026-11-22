@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.2] - 2026-11-22 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Challenge modes (read from the character's mod-challenge-modes settings, `AutonomousAltBots.Challenge.*`): a Quest Only alt drops the grind strategy; a Hardcore character cannot be turned on unless `Challenge.AllowHardcore = 1`, and an enrolled character that is on Hardcore is turned off.
+- Fixed: a Hardcore alt that died was logged back in every check, then killed and kicked by mod-challenge-modes. Now it is turned off and logged out as soon as it dies, and a character flagged dead is never logged in.
+
 ## [1.0.1-tofu.1] - 2026-11-19 (Tofu Worldview fork, branch tofu)
 
 ### Changed

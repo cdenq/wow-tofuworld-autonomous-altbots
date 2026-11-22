@@ -8,6 +8,7 @@ This is the `tofu` branch, a fork of [Gutwormy/mod-autonomous-altbots](https://g
 - **Grouping:** a real player who may control the alt (same account, same guild if `Playerbots.AllowGuildBots`, a linked account, or a GM) can invite it; it follows and takes commands like an altbot, then goes back to playing on its own after the player leaves or logs out. Other invites are declined.
 - **On level-up** (playerbots fork): learns class-trainer spells and pays the trainer cost, spends talent points in its current tree, and teleports to a zone for its new level (never a city). Class quest spells are granted as for random bots.
 - **Hunter ammo:** below `AutonomousAltBots.Restock.AmmoThreshold`, a hunter that can afford ammo walks to the nearest friendly ammo vendor on its map and buys with its own gold; without gold it keeps grinding.
+- **Challenge modes:** a Quest Only alt does not grind; Hardcore characters cannot be turned on (`AutonomousAltBots.Challenge.AllowHardcore`), and a Hardcore alt that dies is turned off and logged out for good.
 - **Data safety:** enrolled alts are never in the random bot pool, so the random-bot randomize step (which empties bags) never runs on them.
 
 ---
