@@ -24,6 +24,17 @@
  *   quest givers (mod-playerbots "tofu party"). Group quests and elites go by the members present. A real player who
  *   may control a member can invite it out of the party group; it rejoins when it is free. `.autoalt party join`
  *   puts a real player at the head of the whole party.
+ * - Dungeons (Dungeon.Enable = 1, needs Party.Enable): a party queues through the Dungeon Finder for the lowest dungeon
+ *   it has not cleared (table tofu_autoalt_party_dungeon), with one tank and one healer assigned. A free party smaller
+ *   than five is filled by mod-dungeon-clear (Tofu fork, DungeonQueueFill.TofuParties); a challenge party goes only as
+ *   a full five of its own members. mod-dungeon-clear runs the clear and reports the end; the party is teleported
+ *   out, regroups, and goes back to questing. Members decline outside invites while queued or inside.
+ * - Self Crafted (index SelfCraftedIndex below DisableLevel): the alt learns its class's professions
+ *   (SelfCrafted.Professions.<Class>), crafts toward the best upgrade it can make, and steers toward the materials
+ *   (mod-playerbots "tofu self crafted"). Gear it cannot wear is disenchanted or sold.
+ * - Restock trips (Hub.Enable = 1): when bags fill up, gear wears out, ammo runs low, a tool is missing, a forge or
+ *   anvil craft is ready, or a profession rank is waiting, a solo alt or a whole party teleports to the guild hub,
+ *   each member does its own errands there (mod-playerbots "tofu hub"), and they teleport back together.
  */
 
 #include "AccountMgr.h"
@@ -35,6 +46,8 @@
 #include "Group.h"
 #include "GroupMgr.h"
 #include "GroupReference.h"
+#include "LFGMgr.h"
+#include "MapMgr.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Tokenize.h"
@@ -49,10 +62,12 @@
 #include "World.h"
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
+#include "DBCStores.h"
 
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -64,7 +79,7 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr char SETTING_SOURCE[] = "mod_autonomous_altbots";
-constexpr char MODULE_VERSION[] = "1.0.1-tofu.4";
+constexpr char MODULE_VERSION[] = "1.0.1-tofu.5";
 constexpr uint32 SETTING_ENABLED = 0;
 constexpr uint32 STOP_WATCH_DURATION_MS = 30000;
 
@@ -91,6 +106,70 @@ struct AutonomousAltConfig
     // Parties.
     bool partyEnable = false;
     float partyRegroupDistance = 300.0f;
+
+    // Self Crafted.
+    bool selfCraftedEnable = true;
+    int32 selfCraftedIndex = 2;
+    std::unordered_map<uint8, std::vector<uint32>> selfCraftedProfessions;  // class -> skill ids, in order
+
+    // Dungeons.
+    bool dungeonEnable = false;
+    uint32 dungeonMinLevel = 15;
+    bool dungeonRepeatPerLevel = true;
+    uint32 dungeonRetryCooldownMs = 60 * MINUTE * IN_MILLISECONDS;
+    uint32 dungeonClearedCooldownMs = 2 * MINUTE * IN_MILLISECONDS;
+    uint32 dungeonQueueTimeoutMs = 10 * MINUTE * IN_MILLISECONDS;
+    uint32 dungeonRunTimeoutMs = 90 * MINUTE * IN_MILLISECONDS;
+
+    // Restock trips to the guild hub.
+    bool hubEnable = false;
+    uint32 hubMaxMs = 5 * MINUTE * IN_MILLISECONDS;
+    uint32 hubMinIntervalMs = 20 * MINUTE * IN_MILLISECONDS;
+};
+
+// Party activity, kept in memory (world thread).
+enum class PartyPhase : uint8
+{
+    Open,     // open-world questing (ProcessParties manages the group)
+    Queued,   // in the Dungeon Finder
+    Dungeon,  // inside; mod-dungeon-clear runs the clear
+    Leaving,  // teleported out; the group is split back up next check
+    Hub       // restock trip at the guild hub
+};
+
+struct ReturnPoint
+{
+    uint32 mapId = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float o = 0.0f;
+    bool set = false;
+};
+
+struct PartyRun
+{
+    PartyPhase phase = PartyPhase::Open;
+    uint32 since = 0;
+    ObjectGuid leader;
+    ObjectGuid groupGuid;
+    uint32 dungeonId = 0;
+    bool hardcore = false;
+    bool cleared = false;
+    uint32 memberCount = 0;
+    uint32 nextDungeonAt = 0;    // getMSTime() before which no new queue (0 = now)
+    uint8 lastRepeatLevel = 0;   // lowest member level of the last repeat run
+    uint32 lastHubAt = 0;
+    ReturnPoint back;
+    std::string status = "questing";
+};
+
+struct SoloHub
+{
+    bool active = false;
+    uint32 since = 0;
+    uint32 lastHubAt = 0;
+    ReturnPoint back;
 };
 
 constexpr uint32 PARTY_MAX_MEMBERS = 5;
@@ -102,6 +181,7 @@ struct Party
     std::string name;
     uint32 ownerAccount = 0;
     std::vector<ObjectGuid::LowType> members;
+    std::unordered_set<uint32> clearedDungeons;  // LFG dungeon ids (tofu_autoalt_party_dungeon)
 };
 
 AutonomousAltConfig g_Config;
@@ -118,6 +198,11 @@ std::map<uint32, Party> g_Parties;
 std::unordered_map<ObjectGuid::LowType, uint32> g_PartyOfMember;
 // This check's roles: member -> its party leader (the leader maps to itself). Rebuilt every check.
 std::unordered_map<ObjectGuid::LowType, ObjectGuid::LowType> g_PartyRole;
+
+// Dungeon runs and hub trips (world thread).
+std::unordered_map<uint32, PartyRun> g_PartyRuns;
+std::unordered_map<ObjectGuid::LowType, SoloHub> g_SoloHub;
+std::unordered_set<ObjectGuid::LowType> g_PartyBusy;  // members of a party that is not Open this check
 
 // Hardcore alts that died since the last update (filled from map threads, handled on the world thread).
 std::mutex g_PendingDeathsMutex;
@@ -160,6 +245,71 @@ void LoadConfig()
     g_Config.partyEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Party.Enable", false);
     g_Config.partyRegroupDistance = sConfigMgr->GetOption<float>("AutonomousAltBots.Party.RegroupDistance", 300.0f);
 
+    g_Config.selfCraftedEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.SelfCrafted.Enable", true);
+    g_Config.selfCraftedIndex = sConfigMgr->GetOption<int32>("AutonomousAltBots.Challenge.SelfCraftedIndex", 2);
+    g_Config.selfCraftedProfessions.clear();
+    static std::vector<std::pair<char const*, uint32>> const professionNames = {
+        {"alchemy", SKILL_ALCHEMY}, {"blacksmithing", SKILL_BLACKSMITHING}, {"enchanting", SKILL_ENCHANTING},
+        {"engineering", SKILL_ENGINEERING}, {"herbalism", SKILL_HERBALISM}, {"inscription", SKILL_INSCRIPTION},
+        {"jewelcrafting", SKILL_JEWELCRAFTING}, {"leatherworking", SKILL_LEATHERWORKING}, {"mining", SKILL_MINING},
+        {"skinning", SKILL_SKINNING}, {"tailoring", SKILL_TAILORING}};
+    static std::vector<std::tuple<uint8, char const*, char const*>> const classDefaults = {
+        {CLASS_DEATH_KNIGHT, "DeathKnight", "Mining,Blacksmithing,Jewelcrafting,Engineering"},
+        {CLASS_DRUID, "Druid", "Skinning,Leatherworking,Mining,Blacksmithing"},
+        {CLASS_HUNTER, "Hunter", "Skinning,Leatherworking,Mining,Engineering"},
+        {CLASS_MAGE, "Mage", "Tailoring,Enchanting,Mining,Jewelcrafting"},
+        {CLASS_PALADIN, "Paladin", "Mining,Blacksmithing,Jewelcrafting,Engineering"},
+        {CLASS_PRIEST, "Priest", "Tailoring,Enchanting,Mining,Jewelcrafting"},
+        {CLASS_ROGUE, "Rogue", "Skinning,Leatherworking,Mining,Blacksmithing"},
+        {CLASS_SHAMAN, "Shaman", "Skinning,Leatherworking,Mining,Blacksmithing"},
+        {CLASS_WARLOCK, "Warlock", "Tailoring,Enchanting,Mining,Jewelcrafting"},
+        {CLASS_WARRIOR, "Warrior", "Mining,Blacksmithing,Jewelcrafting,Engineering"}};
+    for (auto const& [classId, className, defaultList] : classDefaults)
+    {
+        std::string const list = sConfigMgr->GetOption<std::string>(
+            std::string("AutonomousAltBots.SelfCrafted.Professions.") + className, defaultList);
+        std::vector<uint32> skills;
+        for (std::string_view token : Acore::Tokenize(list, ',', false))
+        {
+            std::string name(token);
+            name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char c) { return std::isspace(c); }),
+                       name.end());
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            for (auto const& [professionName, skill] : professionNames)
+                if (name == professionName)
+                    skills.push_back(skill);
+        }
+        g_Config.selfCraftedProfessions[classId] = skills;
+    }
+
+    g_Config.dungeonEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Dungeon.Enable", false);
+    g_Config.dungeonMinLevel = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Dungeon.MinLevel", 15);
+    g_Config.dungeonRepeatPerLevel = sConfigMgr->GetOption<bool>("AutonomousAltBots.Dungeon.RepeatPerLevel", true);
+    g_Config.dungeonRetryCooldownMs =
+        sConfigMgr->GetOption<uint32>("AutonomousAltBots.Dungeon.RetryCooldownMinutes", 60) * MINUTE * IN_MILLISECONDS;
+    g_Config.dungeonQueueTimeoutMs =
+        sConfigMgr->GetOption<uint32>("AutonomousAltBots.Dungeon.QueueTimeoutMinutes", 10) * MINUTE * IN_MILLISECONDS;
+    g_Config.dungeonRunTimeoutMs =
+        sConfigMgr->GetOption<uint32>("AutonomousAltBots.Dungeon.RunTimeoutMinutes", 90) * MINUTE * IN_MILLISECONDS;
+
+    g_Config.hubEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Hub.Enable", false);
+    g_Config.hubMaxMs = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.MaxMinutes", 5) * MINUTE * IN_MILLISECONDS;
+    g_Config.hubMinIntervalMs =
+        sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.MinIntervalMinutes", 20) * MINUTE * IN_MILLISECONDS;
+
+    TofuAutonomousAlt::HubSettings hub;
+    hub.enable = g_Config.hubEnable;
+    hub.mapId = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.Map", 1);
+    hub.x = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.X", 16228.407f);
+    hub.y = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.Y", 16306.691f);
+    hub.z = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.Z", 29.263594f);
+    hub.o = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.O", 6.263572f);
+    hub.radius = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.Radius", 120.0f);
+    hub.sellRepairEntry = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.SellRepairEntry", 900003);
+    hub.ammoVendorEntry = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.AmmoVendorEntry", 0);
+    hub.errandStuckMs = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.ErrandStuckSeconds", 20) * IN_MILLISECONDS;
+    TofuAutonomousAlt::SetHubSettings(hub);
+
     TofuAutonomousAlt::Settings settings;
     settings.teleportForLevel = sConfigMgr->GetOption<bool>("AutonomousAltBots.LevelUp.TeleportForLevel", true);
     settings.learnTrainerSpells = sConfigMgr->GetOption<bool>("AutonomousAltBots.LevelUp.LearnTrainerSpells", true);
@@ -173,6 +323,8 @@ void LoadConfig()
     settings.hardcoreMaxLevelsAbove = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hardcore.MaxLevelsAbove", 2);
     settings.partyEliteMinMembers = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Party.EliteMinMembers", 3);
     settings.partyPresentRange = sConfigMgr->GetOption<float>("AutonomousAltBots.Party.PresentRange", 100.0f);
+    settings.restockBagPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.BagPct", 50.0f);
+    settings.restockDurabilityPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.DurabilityPct", 25.0f);
     TofuAutonomousAlt::SetSettings(settings);
 }
 
@@ -250,6 +402,17 @@ void LoadParties()
                 continue;
             itr->second.members.push_back(guid);
             g_PartyOfMember[guid] = partyId;
+        } while (result->NextRow());
+    }
+
+    if (QueryResult result = CharacterDatabase.Query("SELECT party_id, dungeon_id FROM tofu_autoalt_party_dungeon"))
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            auto itr = g_Parties.find(fields[0].Get<uint32>());
+            if (itr != g_Parties.end())
+                itr->second.clearedDungeons.insert(fields[1].Get<uint32>());
         } while (result->NextRow());
     }
 
@@ -350,6 +513,11 @@ void ProcessParties(bool active)
 
     for (auto const& [partyId, party] : g_Parties)
     {
+        // A party in the Dungeon Finder, a dungeon, or at the hub keeps the group it has.
+        auto const run = g_PartyRuns.find(partyId);
+        if (run != g_PartyRuns.end() && run->second.phase != PartyPhase::Open)
+            continue;
+
         std::vector<Player*> eligible;
         for (ObjectGuid::LowType lowGuid : party.members)
         {
@@ -466,6 +634,7 @@ struct ChallengeState
     bool hardcoreDead = false;
     bool questOnly = false;
     bool restricting = false;  // any hard mode of the challenge grouping rule (Progression does not count)
+    bool selfCrafted = false;
 };
 
 ChallengeState MakeChallengeState(PlayerSettingVector const& settings, uint8 level)
@@ -478,6 +647,7 @@ ChallengeState MakeChallengeState(PlayerSettingVector const& settings, uint8 lev
     state.hardcore = active && isOn(g_Config.hardcoreIndex);
     state.hardcoreDead = isOn(g_Config.hardcoreDeadIndex);
     state.questOnly = active && isOn(g_Config.questOnlyIndex);
+    state.selfCrafted = active && isOn(g_Config.selfCraftedIndex);
     for (int32 index : g_Config.restrictingIndexes)
         state.restricting = state.restricting || (active && isOn(index));
     return state;
@@ -488,7 +658,8 @@ ChallengeState GetChallengeState(Player* player)
     if (!player || g_Config.challengeSource.empty())
         return {};
 
-    int32 highest = std::max({g_Config.hardcoreIndex, g_Config.hardcoreDeadIndex, g_Config.questOnlyIndex});
+    int32 highest = std::max(
+        {g_Config.hardcoreIndex, g_Config.hardcoreDeadIndex, g_Config.questOnlyIndex, g_Config.selfCraftedIndex});
     for (int32 index : g_Config.restrictingIndexes)
         highest = std::max(highest, index);
     PlayerSettingVector settings;
@@ -542,6 +713,68 @@ void ApplyHardcoreSurvival(Player* bot, PlayerbotAI* botAI, bool hardcore)
         botAI->ChangeStrategy("-pvp", BOT_STATE_NON_COMBAT);
 }
 
+// Self Crafted: the profession list goes to mod-playerbots and the "tofu self crafted" strategy crafts toward the
+// alt's goal. Applied while a real player leads it too.
+void ApplySelfCrafted(Player* bot, PlayerbotAI* botAI, bool selfCrafted)
+{
+    selfCrafted = selfCrafted && g_Config.selfCraftedEnable;
+    ObjectGuid::LowType const guid = bot->GetGUID().GetCounter();
+
+    if (selfCrafted)
+    {
+        auto const itr = g_Config.selfCraftedProfessions.find(bot->getClass());
+        std::vector<uint32> skills = itr != g_Config.selfCraftedProfessions.end() ? itr->second : std::vector<uint32>();
+        if (skills.empty())
+            skills.push_back(SKILL_MINING);  // an empty list would read as "off"
+        bool const first = !TofuAutonomousAlt::IsSelfCrafted(bot);
+        TofuAutonomousAlt::SetSelfCrafted(guid, skills);
+        if (first)
+            TofuAutonomousAlt::LearnProfessions(bot);
+    }
+    else
+        TofuAutonomousAlt::SetSelfCrafted(guid, {});
+
+    bool const has = botAI->HasStrategy("tofu self crafted", BOT_STATE_NON_COMBAT);
+    if (selfCrafted && !has)
+        botAI->ChangeStrategy("+tofu self crafted", BOT_STATE_NON_COMBAT);
+    else if (!selfCrafted && has)
+        botAI->ChangeStrategy("-tofu self crafted", BOT_STATE_NON_COMBAT);
+}
+
+// At the hub: no master, no questing, grinding, wandering, or following; only the "tofu hub" errands.
+void ApplyHubStrategies(PlayerbotAI* botAI)
+{
+    if (botAI->GetMaster())
+        botAI->SetMaster(nullptr);
+
+    for (char const* strategy : { "quest", "grind", "new rpg", "follow", "tofu party", "stay" })
+        if (botAI->HasStrategy(strategy, BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy(std::string("-") + strategy, BOT_STATE_NON_COMBAT);
+
+    if (!botAI->HasStrategy("tofu hub", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("+tofu hub", BOT_STATE_NON_COMBAT);
+
+    botAI->AllowActivity(ALL_ACTIVITY, true);
+}
+
+// In the Dungeon Finder or a dungeon: mod-dungeon-clear leads; no plan of its own and no master.
+void ApplyDungeonStrategies(PlayerbotAI* botAI, bool inside)
+{
+    if (inside && botAI->GetMaster())
+        botAI->SetMaster(nullptr);
+
+    for (char const* strategy : { "grind", "new rpg", "tofu party", "stay", "tofu hub" })
+        if (botAI->HasStrategy(strategy, BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy(std::string("-") + strategy, BOT_STATE_NON_COMBAT);
+
+    if (inside)
+        for (char const* strategy : { "quest", "follow" })
+            if (botAI->HasStrategy(strategy, BOT_STATE_NON_COMBAT))
+                botAI->ChangeStrategy(std::string("-") + strategy, BOT_STATE_NON_COMBAT);
+
+    botAI->AllowActivity(ALL_ACTIVITY, true);
+}
+
 // A party follower: the party leader is its master; it follows, fights with the party, accepts and turns in quests
 // at the givers the leader visits ("tofu party"), and runs no quest, grind, or new rpg plan of its own.
 void ApplyFollowerStrategies(Player* bot, PlayerbotAI* botAI, ObjectGuid::LowType leaderGuid)
@@ -576,6 +809,7 @@ void ApplyAutonomousStrategies(Player* bot, ChallengeState const& challenge)
         return;
 
     ApplyHardcoreSurvival(bot, botAI, challenge.hardcore);
+    ApplySelfCrafted(bot, botAI, challenge.selfCrafted);
     bool const questOnly = challenge.questOnly;
 
     // Grouped with a real player: that player is in charge (follow, commands, trade). Hands off.
@@ -583,6 +817,22 @@ void ApplyAutonomousStrategies(Player* bot, ChallengeState const& challenge)
         return;
 
     ObjectGuid::LowType const self = bot->GetGUID().GetCounter();
+
+    if (TofuAutonomousAlt::IsHubVisitActive(self))
+    {
+        ApplyHubStrategies(botAI);
+        return;
+    }
+
+    if (botAI->HasStrategy("tofu hub", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("-tofu hub", BOT_STATE_NON_COMBAT);
+
+    if (g_PartyBusy.contains(self))
+    {
+        ApplyDungeonStrategies(botAI, bot->GetMap() && bot->GetMap()->IsDungeon());
+        return;
+    }
+
     auto const role = g_PartyRole.find(self);
     bool const inParty = role != g_PartyRole.end();
 
@@ -708,6 +958,533 @@ void SendStatus(ChatHandler* handler, ObjectGuid guid)
         desired ? "on" : "off",
         state,
         connected ? connected->GetLevel() : sCharacterCache->GetCharacterLevelByGuid(guid));
+
+    if (connected && IsPlayerbot(connected))
+    {
+        if (TofuAutonomousAlt::IsHubVisitActive(guid.GetCounter()))
+            handler->SendSysMessage("  Restocking at the guild hub.");
+        std::string const crafted = TofuAutonomousAlt::DescribeSelfCrafted(connected);
+        if (!crafted.empty())
+            handler->PSendSysMessage("  {}", crafted);
+    }
+}
+
+
+// ---- Dungeon runs and hub trips ----
+
+bool ReadyToTravel(Player* bot)
+{
+    return bot && bot->IsInWorld() && bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
+           !bot->IsBeingTeleported() && bot->GetMap() && !bot->GetMap()->Instanceable();
+}
+
+ReturnPoint PointOf(Player* bot)
+{
+    ReturnPoint point;
+    point.mapId = bot->GetMapId();
+    point.x = bot->GetPositionX();
+    point.y = bot->GetPositionY();
+    point.z = bot->GetPositionZ();
+    point.o = bot->GetOrientation();
+    point.set = true;
+    return point;
+}
+
+void TeleportHome(Player* bot)
+{
+    bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX, bot->m_homebindY, bot->m_homebindZ, bot->GetOrientation());
+}
+
+void TeleportBack(Player* bot, ReturnPoint const& back)
+{
+    if (back.set)
+        bot->TeleportTo(back.mapId, back.x, back.y, back.z, back.o);
+    else
+        TeleportHome(bot);
+}
+
+void StartHubVisit(Player* bot)
+{
+    TofuAutonomousAlt::HubSettings const hub = TofuAutonomousAlt::GetHubSettings();
+    TofuAutonomousAlt::SetHubVisit(bot->GetGUID().GetCounter(), true);
+    if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+        ApplyHubStrategies(botAI);
+    bot->TeleportTo(hub.mapId, hub.x, hub.y, hub.z, hub.o);
+}
+
+void EndHubVisit(Player* bot, ReturnPoint const& back)
+{
+    TofuAutonomousAlt::SetHubVisit(bot->GetGUID().GetCounter(), false);
+    if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+        if (botAI->HasStrategy("tofu hub", BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy("-tofu hub", BOT_STATE_NON_COMBAT);
+    TeleportBack(bot, back);
+}
+
+// Whether a trip to the hub is due: something to fix, and not too soon after the last one.
+bool HubTripDue(uint32 needs, uint32 lastHubAt, uint32 now)
+{
+    if (!g_Config.hubEnable || !needs)
+        return false;
+
+    // Low ammo goes sooner (GetRestockNeeds reports it only when the hub sells ammo).
+    if (needs & TofuAutonomousAlt::RESTOCK_AMMO)
+        return !lastHubAt || getMSTimeDiff(lastHubAt, now) >= g_Config.hubMinIntervalMs / 4;
+
+    return !lastHubAt || getMSTimeDiff(lastHubAt, now) >= g_Config.hubMinIntervalMs;
+}
+
+bool InHubArea(Player* bot)
+{
+    TofuAutonomousAlt::HubSettings const hub = TofuAutonomousAlt::GetHubSettings();
+    return bot->GetMapId() == hub.mapId && bot->GetExactDist(hub.x, hub.y, hub.z) <= hub.radius;
+}
+
+// Online members of a party that play as bots and are not with a real player.
+std::vector<Player*> OnlinePartyBots(Party const& party)
+{
+    std::vector<Player*> members;
+    for (ObjectGuid::LowType lowGuid : party.members)
+    {
+        if (!g_DesiredBots.contains(lowGuid))
+            continue;
+        Player* member = FindConnectedCharacter(ObjectGuid::Create<HighGuid::Player>(lowGuid));
+        if (member && member->IsInWorld() && IsPlayerbot(member) && !GroupedWithRealPlayer(member))
+            members.push_back(member);
+    }
+    return members;
+}
+
+void ClearRunFlags(std::vector<ObjectGuid::LowType> const& members, ObjectGuid leader)
+{
+    for (ObjectGuid::LowType guid : members)
+    {
+        TofuAutonomousAlt::SetDungeonBusy(guid, false);
+        TofuAutonomousAlt::SetLfgRoles(guid, 0);
+    }
+    if (!leader.IsEmpty())
+        TofuAutonomousAlt::CancelDungeonClear(leader);
+}
+
+// LFG dungeons (normal, not seasonal) that no member is locked out of.
+std::vector<lfg::LFGDungeonData const*> CandidateDungeons(std::vector<Player*> const& members, Group* group)
+{
+    std::vector<lfg::LFGDungeonData const*> candidates;
+    for (Player* member : members)
+        sLFGMgr->InitializeLockedDungeons(member, group);
+
+    for (uint32 i = 0; i < sLFGDungeonStore.GetNumRows(); ++i)
+    {
+        LFGDungeonEntry const* entry = sLFGDungeonStore.LookupEntry(i);
+        if (!entry)
+            continue;
+
+        lfg::LFGDungeonData const* data = sLFGMgr->GetLFGDungeon(entry->ID);
+        if (!data || data->type != lfg::LFG_TYPE_DUNGEON || data->difficulty != DUNGEON_DIFFICULTY_NORMAL ||
+            data->seasonal)
+            continue;
+
+        bool locked = false;
+        for (Player* member : members)
+            if (sLFGMgr->GetLockedDungeons(member->GetGUID()).contains(data->Entry()))
+                locked = true;
+
+        if (!locked)
+            candidates.push_back(data);
+    }
+    return candidates;
+}
+
+// Tries to put the grouped party in the Dungeon Finder. Returns true when it is queued.
+bool TryQueueDungeon(Party& party, PartyRun& run, Player* leader, std::vector<Player*> const& grouped, uint32 now)
+{
+    if (!g_Config.dungeonEnable || grouped.size() < 2)
+        return false;
+
+    if (run.nextDungeonAt && static_cast<int32>(run.nextDungeonAt - now) > 0)
+        return false;
+
+    Group* group = leader->GetGroup();
+    if (!group || group->GetLeaderGUID() != leader->GetGUID())
+        return false;
+
+    bool restricted = false;
+    bool hardcore = false;
+    uint8 lowest = 255;
+    for (Player* member : grouped)
+    {
+        if (!ReadyToTravel(member))
+            return false;
+        ChallengeState const state = GetChallengeState(member);
+        restricted = restricted || state.restricting;
+        hardcore = hardcore || state.hardcore;
+        lowest = std::min<uint8>(lowest, member->GetLevel());
+    }
+
+    if (lowest < g_Config.dungeonMinLevel)
+    {
+        run.status = "questing (dungeons from level " + std::to_string(g_Config.dungeonMinLevel) + ")";
+        return false;
+    }
+
+    if (restricted && (grouped.size() < PARTY_MAX_MEMBERS || party.members.size() < PARTY_MAX_MEMBERS))
+    {
+        run.status = "questing (a challenge party goes to dungeons only as a full five)";
+        return false;
+    }
+
+    // One tank and one healer; everyone else (a second tank or healer too) queues as damage.
+    std::vector<std::pair<Player*, uint8>> roles;
+    bool tank = false;
+    bool healer = false;
+    for (Player* member : grouped)
+    {
+        uint8 role = lfg::PLAYER_ROLE_DAMAGE;
+        if (!tank && PlayerbotAI::IsTank(member))
+        {
+            role = lfg::PLAYER_ROLE_TANK;
+            tank = true;
+        }
+        else if (!healer && PlayerbotAI::IsHeal(member))
+        {
+            role = lfg::PLAYER_ROLE_HEALER;
+            healer = true;
+        }
+        roles.emplace_back(member, role);
+    }
+
+    if (grouped.size() >= PARTY_MAX_MEMBERS && (!tank || !healer))
+    {
+        run.status = "questing (a full party needs a tank and a healer for the Dungeon Finder)";
+        return false;
+    }
+
+    std::vector<lfg::LFGDungeonData const*> candidates = CandidateDungeons(grouped, group);
+    if (candidates.empty())
+    {
+        run.status = "questing (no dungeon open to every member)";
+        return false;
+    }
+
+    lfg::LFGDungeonData const* chosen = nullptr;
+    for (lfg::LFGDungeonData const* data : candidates)
+        if (!party.clearedDungeons.contains(data->id) && (!chosen || data->minlevel < chosen->minlevel))
+            chosen = data;
+
+    if (!chosen)
+    {
+        if (!g_Config.dungeonRepeatPerLevel || lowest <= run.lastRepeatLevel)
+        {
+            run.status = "questing (every dungeon in range cleared; repeats at the next level)";
+            return false;
+        }
+        chosen = candidates[urand(0, candidates.size() - 1)];
+        run.lastRepeatLevel = lowest;
+    }
+
+    uint8 leaderRoles = lfg::PLAYER_ROLE_DAMAGE;
+    std::vector<ObjectGuid::LowType> guids;
+    for (auto const& [member, role] : roles)
+    {
+        ObjectGuid::LowType const guid = member->GetGUID().GetCounter();
+        guids.push_back(guid);
+        TofuAutonomousAlt::SetDungeonBusy(guid, true);
+        TofuAutonomousAlt::SetLfgRoles(guid, role);
+        if (member == leader)
+            leaderRoles = role;
+    }
+    leaderRoles |= lfg::PLAYER_ROLE_LEADER;
+
+    TofuAutonomousAlt::RequestDungeonClear(leader->GetGUID(), hardcore);
+
+    lfg::LfgDungeonSet dungeons;
+    dungeons.insert(chosen->id);
+    sLFGMgr->JoinLfg(leader, leaderRoles, dungeons, "");
+
+    if (sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_NONE &&
+        sLFGMgr->GetState(leader->GetGUID()) == lfg::LFG_STATE_NONE)
+    {
+        ClearRunFlags(guids, leader->GetGUID());
+        run.nextDungeonAt = now + 10 * MINUTE * IN_MILLISECONDS;
+        run.status = "questing (the Dungeon Finder refused " + chosen->name + ")";
+        return false;
+    }
+
+    run.phase = PartyPhase::Queued;
+    run.since = now;
+    run.leader = leader->GetGUID();
+    run.groupGuid = group->GetGUID();
+    run.dungeonId = chosen->id;
+    run.hardcore = hardcore;
+    run.cleared = false;
+    run.memberCount = static_cast<uint32>(grouped.size());
+    run.status = "queued for " + chosen->name;
+    LOG_INFO("module", "mod-autonomous-altbots: party {} queued for {} ({} member(s), {} filled)", party.name,
+             chosen->name, grouped.size(), grouped.size() < PARTY_MAX_MEMBERS ? "rest" : "none");
+    return true;
+}
+
+void EndDungeonRun(Party& party, PartyRun& run, bool cleared, char const* why, uint32 now)
+{
+    run.cleared = cleared;
+    for (Player* member : OnlinePartyBots(party))
+    {
+        if (!member->GetMap() || !member->GetMap()->IsDungeon())
+            continue;
+
+        if (member->isDead() && !GetChallengeState(member).hardcore)
+        {
+            member->ResurrectPlayer(0.5f);
+            member->SpawnCorpseBones();
+        }
+        sLFGMgr->TeleportPlayer(member, true);
+    }
+
+    if (cleared)
+    {
+        party.clearedDungeons.insert(run.dungeonId);
+        CharacterDatabase.Execute("REPLACE INTO tofu_autoalt_party_dungeon (party_id, dungeon_id) VALUES ({}, {})",
+                                  party.id, run.dungeonId);
+    }
+
+    LOG_INFO("module", "mod-autonomous-altbots: party {} dungeon run ended: {}", party.name, why);
+    run.phase = PartyPhase::Leaving;
+    run.since = now;
+    run.status = std::string("leaving the dungeon (") + why + ")";
+}
+
+void FinishLeaving(Party& party, PartyRun& run, uint32 now)
+{
+    for (Player* member : OnlinePartyBots(party))
+        if (member->GetGroup())
+            member->RemoveFromGroup();  // the fill bots are released when the leader leaves; the party regroups
+
+    ClearRunFlags(party.members, run.leader);
+    run.nextDungeonAt = now + (run.cleared ? g_Config.dungeonClearedCooldownMs : g_Config.dungeonRetryCooldownMs);
+    run.phase = PartyPhase::Open;
+    run.since = now;
+    run.status = "questing";
+}
+
+void ProcessPartyRuns(bool active)
+{
+    g_PartyBusy.clear();
+    uint32 const now = getMSTime();
+
+    for (auto& [partyId, party] : g_Parties)
+    {
+        PartyRun& run = g_PartyRuns[partyId];
+        std::vector<Player*> const online = OnlinePartyBots(party);
+
+        switch (run.phase)
+        {
+            case PartyPhase::Open:
+            {
+                if (!active || !g_Config.partyEnable)
+                    break;
+
+                // The members grouped under one leader this check (ProcessParties).
+                Player* leader = nullptr;
+                std::vector<Player*> grouped;
+                for (Player* member : online)
+                {
+                    auto const role = g_PartyRole.find(member->GetGUID().GetCounter());
+                    if (role == g_PartyRole.end())
+                        continue;
+                    grouped.push_back(member);
+                    if (role->second == member->GetGUID().GetCounter())
+                        leader = member;
+                }
+
+                if (!leader || grouped.size() < 2)
+                {
+                    run.status = online.empty() ? "offline" : "questing";
+                    break;
+                }
+
+                // Restock first: a trip to the hub for the whole party.
+                uint32 needs = 0;
+                bool ready = true;
+                for (Player* member : grouped)
+                {
+                    needs |= TofuAutonomousAlt::GetRestockNeeds(member);
+                    ready = ready && ReadyToTravel(member);
+                }
+
+                if (ready && HubTripDue(needs, run.lastHubAt, now))
+                {
+                    run.back = PointOf(leader);
+                    run.phase = PartyPhase::Hub;
+                    run.since = now;
+                    run.memberCount = static_cast<uint32>(grouped.size());
+                    run.status = "restocking at the guild hub";
+                    for (Player* member : grouped)
+                        StartHubVisit(member);
+                    break;
+                }
+
+                if (!TryQueueDungeon(party, run, leader, grouped, now) && run.status.rfind("questing", 0) != 0)
+                    run.status = "questing";
+                break;
+            }
+            case PartyPhase::Queued:
+            {
+                Player* leader = FindConnectedCharacter(run.leader);
+                Group* group = leader ? leader->GetGroup() : nullptr;
+                if (!leader || !group)
+                {
+                    ClearRunFlags(party.members, run.leader);
+                    run.phase = PartyPhase::Open;
+                    run.nextDungeonAt = now + 10 * MINUTE * IN_MILLISECONDS;
+                    run.status = "questing (the queue ended: the leader left)";
+                    break;
+                }
+
+                if (leader->GetMap() && leader->GetMap()->IsDungeon())
+                {
+                    run.phase = PartyPhase::Dungeon;
+                    run.since = now;
+                    run.groupGuid = group->GetGUID();
+                    run.memberCount = static_cast<uint32>(online.size());
+                    lfg::LFGDungeonData const* data = sLFGMgr->GetLFGDungeon(run.dungeonId);
+                    run.status = std::string("clearing ") + (data ? data->name : "a dungeon");
+                    break;
+                }
+
+                bool const inQueue = sLFGMgr->GetState(group->GetGUID()) != lfg::LFG_STATE_NONE ||
+                                     sLFGMgr->GetState(leader->GetGUID()) != lfg::LFG_STATE_NONE;
+                bool const timedOut = getMSTimeDiff(run.since, now) > g_Config.dungeonQueueTimeoutMs;
+                if ((!inQueue && getMSTimeDiff(run.since, now) > 15 * IN_MILLISECONDS) || timedOut)
+                {
+                    if (inQueue)
+                    {
+                        sLFGMgr->LeaveLfg(group->GetGUID());
+                        sLFGMgr->LeaveAllLfgQueues(leader->GetGUID(), true, group->GetGUID());
+                    }
+                    ClearRunFlags(party.members, run.leader);
+                    run.phase = PartyPhase::Open;
+                    run.nextDungeonAt = now + 10 * MINUTE * IN_MILLISECONDS;
+                    run.status = timedOut ? "questing (the queue timed out)" : "questing (the queue ended)";
+                }
+                break;
+            }
+            case PartyPhase::Dungeon:
+            {
+                Player* leader = FindConnectedCharacter(run.leader);
+                bool cleared = false;
+                if (TofuAutonomousAlt::ConsumeDungeonClearResult(run.groupGuid.GetCounter(), cleared))
+                    EndDungeonRun(party, run, cleared, cleared ? "all bosses cleared" : "the clear stopped", now);
+                else if (!leader || !leader->GetMap() || !leader->GetMap()->IsDungeon())
+                    EndDungeonRun(party, run, false, "the leader left the dungeon", now);
+                else if (run.hardcore && online.size() < run.memberCount)
+                    EndDungeonRun(party, run, false, "a Hardcore member died", now);
+                else if (getMSTimeDiff(run.since, now) > g_Config.dungeonRunTimeoutMs)
+                    EndDungeonRun(party, run, false, "the run timed out", now);
+                break;
+            }
+            case PartyPhase::Leaving:
+            {
+                uint32 const elapsed = getMSTimeDiff(run.since, now);
+                bool anyInside = false;
+                for (Player* member : online)
+                {
+                    if (!member->GetMap() || !member->GetMap()->IsDungeon() || member->IsBeingTeleported())
+                        continue;
+                    anyInside = true;
+                    if (elapsed > 20 * IN_MILLISECONDS)
+                        TeleportHome(member);
+                    else if (elapsed > 10 * IN_MILLISECONDS)
+                        member->TeleportToEntryPoint();
+                }
+
+                if (!anyInside || elapsed > 40 * IN_MILLISECONDS)
+                    FinishLeaving(party, run, now);
+                break;
+            }
+            case PartyPhase::Hub:
+            {
+                bool allDone = true;
+                for (Player* member : online)
+                    if (TofuAutonomousAlt::IsHubVisitActive(member->GetGUID().GetCounter()) &&
+                        !TofuAutonomousAlt::IsHubVisitDone(member->GetGUID().GetCounter()))
+                        allDone = false;
+
+                if (allDone || getMSTimeDiff(run.since, now) > g_Config.hubMaxMs || !active)
+                {
+                    for (Player* member : online)
+                        if (TofuAutonomousAlt::IsHubVisitActive(member->GetGUID().GetCounter()))
+                            EndHubVisit(member, run.back);
+                    run.phase = PartyPhase::Open;
+                    run.since = now;
+                    run.lastHubAt = now;
+                    run.status = "questing";
+                }
+                break;
+            }
+        }
+
+        if (run.phase == PartyPhase::Queued || run.phase == PartyPhase::Dungeon || run.phase == PartyPhase::Leaving)
+            for (ObjectGuid::LowType guid : party.members)
+                g_PartyBusy.insert(guid);
+    }
+}
+
+// Alts that play alone this check (not grouped as a party, not busy with one): their own hub trips.
+void ProcessSoloHubs(bool active)
+{
+    uint32 const now = getMSTime();
+    for (ObjectGuid::LowType lowGuid : g_DesiredBots)
+    {
+        SoloHub& hub = g_SoloHub[lowGuid];
+        Player* bot = FindConnectedCharacter(ObjectGuid::Create<HighGuid::Player>(lowGuid));
+        if (!bot || !bot->IsInWorld() || !IsPlayerbot(bot))
+        {
+            if (hub.active)
+                TofuAutonomousAlt::SetHubVisit(lowGuid, false);
+            hub.active = false;
+            continue;
+        }
+
+        if (hub.active)
+        {
+            if (TofuAutonomousAlt::IsHubVisitDone(lowGuid) || getMSTimeDiff(hub.since, now) > g_Config.hubMaxMs ||
+                !active || GroupedWithRealPlayer(bot))
+            {
+                EndHubVisit(bot, hub.back);
+                hub.active = false;
+                hub.lastHubAt = now;
+            }
+            continue;
+        }
+
+        if (!active || g_PartyRole.contains(lowGuid) || g_PartyBusy.contains(lowGuid) || GroupedWithRealPlayer(bot) ||
+            TofuAutonomousAlt::IsHubVisitActive(lowGuid))
+            continue;
+
+        if (!ReadyToTravel(bot) || !HubTripDue(TofuAutonomousAlt::GetRestockNeeds(bot), hub.lastHubAt, now))
+            continue;
+
+        hub.back = PointOf(bot);
+        hub.active = true;
+        hub.since = now;
+        StartHubVisit(bot);
+    }
+}
+
+// An alt that logged in at the hub or inside a dungeon with nothing to do there (a trip or run cut short by a logout)
+// goes home.
+void RescueStranded(Player* bot)
+{
+    ObjectGuid::LowType const guid = bot->GetGUID().GetCounter();
+    if (!ReadyToTravel(bot) && !(bot->GetMap() && bot->GetMap()->IsDungeon() && bot->IsAlive()))
+        return;
+    if (bot->IsBeingTeleported() || bot->IsInCombat() || GroupedWithRealPlayer(bot))
+        return;
+    if (TofuAutonomousAlt::IsHubVisitActive(guid) || g_PartyBusy.contains(guid))
+        return;
+
+    if ((g_Config.hubEnable && InHubArea(bot)) || (bot->GetMap() && bot->GetMap()->IsDungeon()))
+        TeleportHome(bot);
 }
 
 class AutonomousAltBotsWorldScript : public WorldScript
@@ -777,6 +1554,8 @@ public:
         std::vector<std::pair<ObjectGuid, char const*>> turnOff;
 
         ProcessParties(playerOnline && !logoutAll);
+        ProcessPartyRuns(playerOnline && !logoutAll);
+        ProcessSoloHubs(playerOnline && !logoutAll);
 
         for (ObjectGuid::LowType lowGuid : g_DesiredBots)
         {
@@ -824,6 +1603,7 @@ public:
                 continue;
             }
 
+            RescueStranded(connected);
             ApplyAutonomousStrategies(connected, state);
         }
 
@@ -888,6 +1668,11 @@ public:
 
         Player* invitee = ObjectAccessor::FindPlayerByName(membername, false);
         if (!invitee || !IsPlayerbot(invitee) || !g_PartyOfMember.contains(invitee->GetGUID().GetCounter()))
+            return true;
+
+        // Queued for or inside a dungeon with its party, or on a hub trip: it stays (the core then declines the invite).
+        if (TofuAutonomousAlt::IsDungeonBusy(invitee->GetGUID().GetCounter()) ||
+            TofuAutonomousAlt::IsHubVisitActive(invitee->GetGUID().GetCounter()))
             return true;
 
         Group* group = invitee->GetGroup();
@@ -1085,6 +1870,17 @@ public:
         return GetOfflineChallengeState(guid);
     }
 
+    // A party in the Dungeon Finder, a dungeon, or at the hub keeps its members until it is back.
+    static bool PartyAway(ChatHandler* handler, Party const& party)
+    {
+        auto const run = g_PartyRuns.find(party.id);
+        if (run == g_PartyRuns.end() || run->second.phase == PartyPhase::Open)
+            return false;
+
+        handler->PSendSysMessage("Party {} is busy ({}); try again when it is back.", party.name, run->second.status);
+        return true;
+    }
+
     static bool HandlePartyCreate(ChatHandler* handler, std::string name)
     {
         if (!PartiesEnabled(handler))
@@ -1200,6 +1996,9 @@ public:
             return false;
         }
 
+        if (PartyAway(handler, *party))
+            return false;
+
         std::string const partyName = party->name;
         RemovePartyMember(guid.GetCounter());
         CharacterDatabase.Execute("DELETE FROM tofu_autoalt_party_member WHERE guid = {}", guid.GetCounter());
@@ -1219,13 +2018,18 @@ public:
             return false;
         }
 
+        if (PartyAway(handler, *party))
+            return false;
+
         uint32 const id = party->id;
         std::string const name = party->name;
         for (ObjectGuid::LowType guid : party->members)
             g_PartyOfMember.erase(guid);
         g_Parties.erase(id);
+        g_PartyRuns.erase(id);
 
         CharacterDatabase.Execute("DELETE FROM tofu_autoalt_party_member WHERE party_id = {}", id);
+        CharacterDatabase.Execute("DELETE FROM tofu_autoalt_party_dungeon WHERE party_id = {}", id);
         CharacterDatabase.Execute("DELETE FROM tofu_autoalt_party WHERE id = {}", id);
         PushPartiesToRegistry();
         handler->PSendSysMessage("Party {} disbanded.", name);
@@ -1240,7 +2044,11 @@ public:
             if (!party)
                 return false;
 
-            handler->PSendSysMessage("Party {} ({} of {}):", party->name, party->members.size(), PARTY_MAX_MEMBERS);
+            auto const run = g_PartyRuns.find(party->id);
+            handler->PSendSysMessage("Party {} ({} of {}): {}; {} dungeon(s) cleared.", party->name,
+                                     party->members.size(), PARTY_MAX_MEMBERS,
+                                     run != g_PartyRuns.end() ? run->second.status : "questing",
+                                     party->clearedDungeons.size());
             for (ObjectGuid::LowType guid : party->members)
                 SendStatus(handler, ObjectGuid::Create<HighGuid::Player>(guid));
             return true;
@@ -1283,6 +2091,9 @@ public:
 
         Party* party = GetParty(handler, partyName);
         if (!party)
+            return false;
+
+        if (PartyAway(handler, *party))
             return false;
 
         std::vector<Player*> members;

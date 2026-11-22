@@ -80,5 +80,71 @@ AutonomousAltBots.Party.EliteMinMembers = 3
 AutonomousAltBots.Party.PresentRange = 100
 AutonomousAltBots.Party.RegroupDistance = 300
 
+# Self Crafted (mod-challenge-modes Self Crafted, index SelfCraftedIndex, active below Challenge.DisableLevel). Requires
+# the Tofu fork of mod-playerbots at the matching commit.
+#   Enable                - 1: the alt learns its class's professions into free primary slots (existing professions are
+#                           kept and used), pays trainer costs and buys vendor recipes, crafts toward the best upgrade
+#                           it can make (else a recipe that still gives skill-ups), and steers toward the materials:
+#                           mining for ore, skinnable beasts for leather, humanoids for cloth, disenchanting (enchanters)
+#                           and prospecting (jewelcrafters). Gear it cannot wear is disenchanted or sold.
+#   Professions.<Class>   - the list, in order, as profession names separated by commas
+AutonomousAltBots.Challenge.SelfCraftedIndex = 2
+AutonomousAltBots.SelfCrafted.Enable = 1
+AutonomousAltBots.SelfCrafted.Professions.DeathKnight = "Mining,Blacksmithing,Jewelcrafting,Engineering"
+AutonomousAltBots.SelfCrafted.Professions.Druid = "Skinning,Leatherworking,Mining,Blacksmithing"
+AutonomousAltBots.SelfCrafted.Professions.Hunter = "Skinning,Leatherworking,Mining,Engineering"
+AutonomousAltBots.SelfCrafted.Professions.Mage = "Tailoring,Enchanting,Mining,Jewelcrafting"
+AutonomousAltBots.SelfCrafted.Professions.Paladin = "Mining,Blacksmithing,Jewelcrafting,Engineering"
+AutonomousAltBots.SelfCrafted.Professions.Priest = "Tailoring,Enchanting,Mining,Jewelcrafting"
+AutonomousAltBots.SelfCrafted.Professions.Rogue = "Skinning,Leatherworking,Mining,Blacksmithing"
+AutonomousAltBots.SelfCrafted.Professions.Shaman = "Skinning,Leatherworking,Mining,Blacksmithing"
+AutonomousAltBots.SelfCrafted.Professions.Warlock = "Tailoring,Enchanting,Mining,Jewelcrafting"
+AutonomousAltBots.SelfCrafted.Professions.Warrior = "Mining,Blacksmithing,Jewelcrafting,Engineering"
+
+# Dungeons for parties (needs Party.Enable = 1 and the Tofu fork of mod-dungeon-clear with
+# DungeonClear.DungeonQueueFill.TofuParties = 1). A grouped party queues through the Dungeon Finder for the lowest
+# dungeon it has not cleared that no member is locked out of, with one tank and one healer assigned. A free party
+# smaller than five is filled with pool bots; a challenge party goes only as a full five of its own members with a tank
+# and a healer. mod-dungeon-clear runs the clear; at the end the party is teleported out and regroups.
+#   Enable               - 1 turns dungeon runs on
+#   MinLevel             - lowest member at least this level (the Dungeon Finder opens at 15)
+#   RepeatPerLevel       - 1: with every dungeon in range cleared, one random in-range run per level the lowest member
+#                          gains
+#   RetryCooldownMinutes - after a run that ended without a clear (wipe, timeout, a Hardcore death)
+#   QueueTimeoutMinutes  - leave the queue after this long
+#   RunTimeoutMinutes    - leave the dungeon after this long
+AutonomousAltBots.Dungeon.Enable = 0
+AutonomousAltBots.Dungeon.MinLevel = 15
+AutonomousAltBots.Dungeon.RepeatPerLevel = 1
+AutonomousAltBots.Dungeon.RetryCooldownMinutes = 60
+AutonomousAltBots.Dungeon.QueueTimeoutMinutes = 10
+AutonomousAltBots.Dungeon.RunTimeoutMinutes = 90
+
+# Restock trips to the guild hub. When a solo alt, or any member of a party, has full bags (BagPct), worn gear
+# (DurabilityPct), low ammo, a missing profession tool, a forge or anvil craft ready, or a profession rank waiting, it
+# (or the whole party) teleports to the hub point, each bot walks its errands there (sell and repair at SellRepairEntry,
+# ammo from the AmmoVendorEntry list through that NPC, its class trainer, each profession trainer, the forge and anvil),
+# and it teleports back to where it was when everyone is done or after MaxMinutes.
+#   Map, X, Y, Z, O       - the hub point (default: the Tofu Worldview guild hub)
+#   Radius                - errand NPCs and objects are looked for within this many yards of the hub point
+#   SellRepairEntry       - creature entry that buys and repairs (0 = any NPC with the repair flag)
+#   AmmoVendorEntry       - npc_vendor list sold through SellRepairEntry for ammo (0 = that NPC's own list)
+#   MinIntervalMinutes    - at least this long between trips (a quarter of it for a missing tool or low ammo)
+#   ErrandStuckSeconds    - a bot that has not reached an errand NPC after this long steps next to it
+AutonomousAltBots.Hub.Enable = 0
+AutonomousAltBots.Hub.Map = 1
+AutonomousAltBots.Hub.X = 16228.407
+AutonomousAltBots.Hub.Y = 16306.691
+AutonomousAltBots.Hub.Z = 29.263594
+AutonomousAltBots.Hub.O = 6.263572
+AutonomousAltBots.Hub.Radius = 120
+AutonomousAltBots.Hub.SellRepairEntry = 900003
+AutonomousAltBots.Hub.AmmoVendorEntry = 0
+AutonomousAltBots.Hub.BagPct = 50
+AutonomousAltBots.Hub.DurabilityPct = 25
+AutonomousAltBots.Hub.MaxMinutes = 5
+AutonomousAltBots.Hub.MinIntervalMinutes = 20
+AutonomousAltBots.Hub.ErrandStuckSeconds = 20
+
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0

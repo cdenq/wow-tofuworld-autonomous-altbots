@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.5] - 2026-11-22 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- Dungeons for parties (`AutonomousAltBots.Dungeon.*`): Dungeon Finder queue for the lowest uncleared dungeon (table `tofu_autoalt_party_dungeon`), one tank and one healer assigned, fill for free parties smaller than five and full-five-only for challenge parties (mod-dungeon-clear Tofu fork), the clear run by mod-dungeon-clear, teleport out and regroup at the end, a retry cooldown after a failed run, one repeat run per level once everything in range is cleared, and outside invites declined while queued or inside.
+- Self Crafted (`AutonomousAltBots.SelfCrafted.*`, `Challenge.SelfCraftedIndex`): class profession lists learned and paid for, craft goals (best craftable upgrade, else a skill-up), material steering, disenchanting and selling of gear the alt cannot wear; `.autoalt status` shows professions and the goal.
+- Restock trips to the guild hub (`AutonomousAltBots.Hub.*`) for solo alts and whole parties: sell, repair, ammo, class and profession training, tools, reagents, recipes, and forge and anvil crafts, then back to where they were.
+
 ## [1.0.1-tofu.4] - 2026-11-22 (Tofu Worldview fork, branch tofu)
 
 ### Added
