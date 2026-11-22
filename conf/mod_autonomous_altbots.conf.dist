@@ -64,5 +64,21 @@ AutonomousAltBots.Hardcore.RestHealthPct = 80
 AutonomousAltBots.Hardcore.FleeHealthPct = 30
 AutonomousAltBots.Hardcore.MaxLevelsAbove = 2
 
+# Challenge grouping side for parties: a party is all characters with any of these mod-challenge-modes indexes active
+# (below DisableLevel), or none. Default: Hardcore, Self Crafted, Green Quality, Quest Only, and One Rate (not
+# Progression, which mod-challenge-modes lets group with anyone). Must match mod-challenge-modes' grouping rule.
+AutonomousAltBots.Challenge.RestrictingIndexes = "0,2,3,6,9"
+
+# Parties (.autoalt party ...), stored in acore_characters.tofu_autoalt_party and tofu_autoalt_party_member. Requires
+# the Tofu fork of mod-playerbots at the matching commit.
+#   Enable          - 1 groups party members that are playing; 0 leaves every alt solo and turns the commands off
+#   EliteMinMembers - an elite quest is done only with at least this many members present
+#   PresentRange    - a member counts as present within this many yards of the leader (same map)
+#   RegroupDistance - a follower on the leader's map farther than this many yards teleports to it (another map always)
+AutonomousAltBots.Party.Enable = 0
+AutonomousAltBots.Party.EliteMinMembers = 3
+AutonomousAltBots.Party.PresentRange = 100
+AutonomousAltBots.Party.RegroupDistance = 300
+
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0

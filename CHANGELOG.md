@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.4] - 2026-11-22 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- Parties (`AutonomousAltBots.Party.*`, `.autoalt party create|add|remove|disband|list|join`): fixed sets of up to 5 enrolled alts that group while playing, led by the lowest-level member. Followers follow and regroup by teleport, turn in and accept quests at the leader's NPCs, and quests are filtered by the members present (playerbots fork). A real player who may control a member can invite it out of the party or lead the whole party. Parties respect the challenge grouping rule (`Challenge.RestrictingIndexes`). New tables `tofu_autoalt_party` and `tofu_autoalt_party_member` in acore_characters, created by the module SQL; a deleted character leaves its party.
+
 ## [1.0.1-tofu.3] - 2026-11-22 (Tofu Worldview fork, branch tofu)
 
 ### Added

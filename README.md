@@ -10,6 +10,7 @@ This is the `tofu` branch, a fork of [Gutwormy/mod-autonomous-altbots](https://g
 - **Hunter ammo:** below `AutonomousAltBots.Restock.AmmoThreshold`, a hunter that can afford ammo walks to the nearest friendly ammo vendor on its map and buys with its own gold; without gold it keeps grinding.
 - **Challenge modes:** a Quest Only alt does not grind; Hardcore characters cannot be turned on (`AutonomousAltBots.Challenge.AllowHardcore`), and a Hardcore alt that dies is turned off and logged out for good.
 - **Hardcore survival** (with `AllowHardcore = 1`): no new fight below 80% health (it eats first), flee below 30%, targets at most 2 levels above, no level-up teleport, no PvP (`AutonomousAltBots.Hardcore.*`).
+- **Parties** (`AutonomousAltBots.Party.Enable = 1`): a party is a fixed set of up to 5 enrolled alts from any accounts (`.autoalt party ...`). Members that are playing group together, the lowest-level member leads, and the rest follow it, teleporting to it on the same map or another map when more than `Party.RegroupDistance` yards away. Followers turn in and accept quests at the NPCs the leader visits. Quests are chosen for the members present: a group quest needs at least its suggested player count present, and an elite quest at least `Party.EliteMinMembers`; a quest already in the log is kept while the full roster would qualify. An alt not in a party never groups with anyone except a real player who may control it. A real player who may control a member can invite just that member out of the party (it rejoins when it leaves that group), or lead the whole party with `.autoalt party join <party>`. A party is all challenge characters (any hard mode except Progression) or none. Known limit: a quest that starts from an item the leader loots does not reach the followers.
 - **Data safety:** enrolled alts are never in the random bot pool, so the random-bot randomize step (which empties bags) never runs on them.
 
 ---
@@ -113,7 +114,13 @@ Commands require AzerothCore's GM command permission.
 | `.autoalt disable <character>` | Alias for `stop`. |
 | `.autoalt status <character>` | Show desired and current online state. |
 | `.autoalt list` | List every enabled autonomous alt. |
-| `.autoalt reload` | Reload selections from `character_settings`. |
+| `.autoalt reload` | Reload selections from `character_settings` and parties from `tofu_autoalt_party`. |
+| `.autoalt party create <party>` | Create a party (1 to 32 letters, digits, `-`, or `_`). Any player; the creator owns it. |
+| `.autoalt party add <party> <character>` | Add an enrolled alt. Same permission as `start`; at most 5 members. |
+| `.autoalt party remove <character>` | Take a character out of its party. The character's account, the party owner, or a GM. |
+| `.autoalt party disband <party>` | Delete the party. The owner or a GM. |
+| `.autoalt party list [party]` | List parties, or one party's members and their state. |
+| `.autoalt party join <party>` | Join the party's group and lead it. You must be ungrouped and allowed to control every member playing. |
 
 The original `.autonomousalt` namespace remains available as a backward-compatible alias. Use the complete `.autoalt`
 name rather than a shorter abbreviation because AzerothCore also provides an `.autobroadcast` command.
