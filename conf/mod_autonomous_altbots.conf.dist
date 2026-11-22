@@ -54,5 +54,15 @@ AutonomousAltBots.Challenge.QuestOnlyIndex = 6
 AutonomousAltBots.Challenge.DisableLevel = 80
 AutonomousAltBots.Challenge.AllowHardcore = 0
 
+# Hardcore survival, for Hardcore alts that may play (AllowHardcore = 1). It applies while a real player leads the alt
+# too. Requires the Tofu fork of mod-playerbots at the matching commit.
+#   RestHealthPct  - out of combat, below this health the alt eats and starts no new fight
+#   FleeHealthPct  - in combat, below this health the alt runs from its attackers until the fight ends or it recovers
+#   MaxLevelsAbove - it picks no target more than this many levels above itself (stock playerbots: 4)
+# Hardcore alts also never teleport on level-up, never go to outdoor PvP objectives, and do not attack enemy players.
+AutonomousAltBots.Hardcore.RestHealthPct = 80
+AutonomousAltBots.Hardcore.FleeHealthPct = 30
+AutonomousAltBots.Hardcore.MaxLevelsAbove = 2
+
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0

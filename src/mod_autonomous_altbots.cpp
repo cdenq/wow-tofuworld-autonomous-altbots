@@ -14,6 +14,10 @@
  * - Challenge modes (read from the character's mod-challenge-modes settings): Quest Only alts do not use the grind
  *   strategy; Hardcore alts cannot be turned on (unless AllowHardcore), and a Hardcore alt that dies, or a character
  *   flagged dead, is turned off and logged out for good.
+ * - Hardcore survival (with AllowHardcore = 1): the alt is flagged Hardcore for mod-playerbots, gets the
+ *   "tofu hardcore" strategy (eat back to the rest threshold, flee below the flee threshold), drops the "pvp" strategy,
+ *   and in mod-playerbots picks no new fight below the rest threshold, no target more than MaxLevelsAbove above it,
+ *   no level-up teleport, and no outdoor PvP. This holds while it is grouped with a real player too.
  */
 
 #include "AccountMgr.h"
@@ -50,7 +54,7 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr char SETTING_SOURCE[] = "mod_autonomous_altbots";
-constexpr char MODULE_VERSION[] = "1.0.1-tofu.2";
+constexpr char MODULE_VERSION[] = "1.0.1-tofu.3";
 constexpr uint32 SETTING_ENABLED = 0;
 constexpr uint32 STOP_WATCH_DURATION_MS = 30000;
 
@@ -123,6 +127,9 @@ void LoadConfig()
     settings.ammoThreshold = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Restock.AmmoThreshold", 200);
     settings.vendorSearchDistance =
         sConfigMgr->GetOption<float>("AutonomousAltBots.Restock.VendorSearchDistance", 3000.0f);
+    settings.hardcoreRestHealthPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hardcore.RestHealthPct", 80.0f);
+    settings.hardcoreFleeHealthPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hardcore.FleeHealthPct", 30.0f);
+    settings.hardcoreMaxLevelsAbove = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hardcore.MaxLevelsAbove", 2);
     TofuAutonomousAlt::SetSettings(settings);
 }
 
@@ -266,11 +273,34 @@ char const* ChallengeBlockReason(ChallengeState const& state)
     return nullptr;
 }
 
-void ApplyAutonomousStrategies(Player* bot, bool questOnly)
+// Hardcore survival, applied whether or not a real player leads the alt: the playerbots-side flag (rest gate, level
+// cap, no teleport, no outdoor PvP) and the "tofu hardcore" strategy in both engines; no "pvp" (attacking enemy
+// players). When Hardcore ends (level 80), the strategy is removed again; "pvp" comes back with the next strategy reset.
+void ApplyHardcoreSurvival(Player* bot, PlayerbotAI* botAI, bool hardcore)
+{
+    TofuAutonomousAlt::SetHardcore(bot->GetGUID().GetCounter(), hardcore);
+
+    for (BotState state : { BOT_STATE_COMBAT, BOT_STATE_NON_COMBAT })
+    {
+        bool const has = botAI->HasStrategy("tofu hardcore", state);
+        if (hardcore && !has)
+            botAI->ChangeStrategy("+tofu hardcore", state);
+        else if (!hardcore && has)
+            botAI->ChangeStrategy("-tofu hardcore", state);
+    }
+
+    if (hardcore && botAI->HasStrategy("pvp", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("-pvp", BOT_STATE_NON_COMBAT);
+}
+
+void ApplyAutonomousStrategies(Player* bot, ChallengeState const& challenge)
 {
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (!botAI)
         return;
+
+    ApplyHardcoreSurvival(bot, botAI, challenge.hardcore);
+    bool const questOnly = challenge.questOnly;
 
     // Grouped with a real player: that player is in charge (follow, commands, trade). Hands off.
     if (GroupedWithRealPlayer(bot))
@@ -501,7 +531,7 @@ public:
                 continue;
             }
 
-            ApplyAutonomousStrategies(connected, state.questOnly);
+            ApplyAutonomousStrategies(connected, state);
         }
 
         for (auto const& [guid, reason] : turnOff)

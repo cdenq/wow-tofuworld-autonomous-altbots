@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.3] - 2026-11-22 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- Hardcore survival for Hardcore alts that may play (`Challenge.AllowHardcore = 1`): flagged for the Tofu playerbots fork (no new fight below `Hardcore.RestHealthPct`, targets at most `Hardcore.MaxLevelsAbove` above, no level-up teleport, no outdoor PvP), the `tofu hardcore` strategy in both engines (eat back to the rest threshold, flee below `Hardcore.FleeHealthPct`), and no `pvp` strategy. Applies while grouped with a real player too.
+
 ## [1.0.1-tofu.2] - 2026-11-22 (Tofu Worldview fork, branch tofu)
 
 ### Changed

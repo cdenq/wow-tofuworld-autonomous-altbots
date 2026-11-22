@@ -9,6 +9,7 @@ This is the `tofu` branch, a fork of [Gutwormy/mod-autonomous-altbots](https://g
 - **On level-up** (playerbots fork): learns class-trainer spells and pays the trainer cost, spends talent points in its current tree, and teleports to a zone for its new level (never a city). Class quest spells are granted as for random bots.
 - **Hunter ammo:** below `AutonomousAltBots.Restock.AmmoThreshold`, a hunter that can afford ammo walks to the nearest friendly ammo vendor on its map and buys with its own gold; without gold it keeps grinding.
 - **Challenge modes:** a Quest Only alt does not grind; Hardcore characters cannot be turned on (`AutonomousAltBots.Challenge.AllowHardcore`), and a Hardcore alt that dies is turned off and logged out for good.
+- **Hardcore survival** (with `AllowHardcore = 1`): no new fight below 80% health (it eats first), flee below 30%, targets at most 2 levels above, no level-up teleport, no PvP (`AutonomousAltBots.Hardcore.*`).
 - **Data safety:** enrolled alts are never in the random bot pool, so the random-bot randomize step (which empties bags) never runs on them.
 
 ---
