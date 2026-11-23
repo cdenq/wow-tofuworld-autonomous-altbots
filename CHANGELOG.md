@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.9] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Multibox guild bank: bots keep consumables they can use (potions, healthstones, food, drink, elixirs, flasks, scrolls).
+
 ## [1.0.1-tofu.8] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Changed

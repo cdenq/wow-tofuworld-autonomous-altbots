@@ -160,7 +160,8 @@ AutonomousAltBots.Hub.ErrandStuckSeconds = 20
 #   ReagentTarget - top up each class reagent to this many (capped at one stack)
 #   GuildBank     - when he opens the guild bank, bots in his guild deposit every unbound item of white quality or
 #                   better (gear, cloth, ore, cooking ingredients, ...), keeping ammo, class reagents, profession tools,
-#                   quest items, and gear they would equip; no gold
+#                   quest items, consumables they can use (potions, food, drink, elixirs, flasks, scrolls), and gear
+#                   they would equip; no gold
 #   GuildBankTabs - guild bank tabs to deposit into, tried in order (1 = first tab)
 # Bots whisper him when they lack gold, bag space, quest log room, or guild bank room or rights.
 AutonomousAltBots.Multibox.Enable = 0

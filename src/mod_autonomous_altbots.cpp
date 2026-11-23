@@ -1922,7 +1922,7 @@ void MultiboxVendor(Player* main, Creature* npc)
 }
 
 // Deposits every unbound item of white quality or better into the configured guild bank tabs, keeping ammo, class
-// reagents, profession tools, quest items, temporary items, and gear it would equip.
+// reagents, profession tools, quest items, temporary items, consumables it can use, and gear it would equip.
 void MultiboxGuildBank(Player* main)
 {
     Guild* guild = main->GetGuildId() ? sGuildMgr->GetGuildById(main->GetGuildId()) : nullptr;
@@ -1947,6 +1947,9 @@ void MultiboxGuildBank(Player* main)
                 proto->Class == ITEM_CLASS_QUEST || proto->Class == ITEM_CLASS_PROJECTILE || proto->Duration ||
                 proto->TotemCategory || item->IsConjuredConsumable() || item->IsRefundable() ||
                 reagents.contains(proto->ItemId))
+                continue;
+            // Consumables it can use (potions, healthstones, food, drink, elixirs, flasks, scrolls) stay with it.
+            if (proto->Class == ITEM_CLASS_CONSUMABLE && alt->CanUseItem(proto) == EQUIP_ERR_OK)
                 continue;
             ItemUsage const usage = UsageFor(alt, proto->ItemId);
             if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
