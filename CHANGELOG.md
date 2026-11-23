@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.7] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Multibox quests: bots copy an accepted quest only when they could take it from the quest giver (level, prerequisites, and the other normal rules), and are completed and rewarded only for quests in their own log.
+- Multibox vendor: bots sell grays and soulbound weapons and armor they cannot use or that are no upgrade; unbound items are no longer sold.
+
+### Added
+
+- Multibox guild bank (`AutonomousAltBots.Multibox.GuildBank`, `.GuildBankTabs`, default tabs 1 and 2): when the main opens the guild bank, his altbots in his guild deposit every unbound item of white quality or better, keeping ammo, class reagents, profession tools, quest items, temporary items, and gear they would equip. No gold.
+
 ## [1.0.1-tofu.6] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Added

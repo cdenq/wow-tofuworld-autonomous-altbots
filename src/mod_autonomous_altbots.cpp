@@ -38,6 +38,10 @@
  */
 
 #include "AccountMgr.h"
+#include "Timer.h"
+#include "GameObject.h"
+#include "GuildMgr.h"
+#include "Guild.h"
 #include "QuestDef.h"
 #include "Creature.h"
 #include "Trainer.h"
@@ -142,6 +146,8 @@ struct AutonomousAltConfig
     bool multiboxVendor = true;
     uint32 multiboxAmmoTarget = 1000;
     uint32 multiboxReagentTarget = 20;
+    bool multiboxGuildBank = true;
+    std::vector<uint8> multiboxGuildBankTabs = { 0, 1 };  // guild bank tabs (0 = first) tried in this order
 };
 
 // Party activity, kept in memory (world thread).
@@ -320,6 +326,12 @@ void LoadConfig()
     g_Config.multiboxVendor = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Vendor", true);
     g_Config.multiboxAmmoTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.AmmoTarget", 1000);
     g_Config.multiboxReagentTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.ReagentTarget", 20);
+    g_Config.multiboxGuildBank = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.GuildBank", true);
+    g_Config.multiboxGuildBankTabs.clear();
+    std::string const bankTabs = sConfigMgr->GetOption<std::string>("AutonomousAltBots.Multibox.GuildBankTabs", "1,2");
+    for (std::string_view token : Acore::Tokenize(bankTabs, ',', false))
+        if (Optional<uint32> tab = Acore::StringTo<uint32>(token); tab && *tab >= 1 && *tab <= GUILD_BANK_MAX_TABS)
+            g_Config.multiboxGuildBankTabs.push_back(static_cast<uint8>(*tab - 1));
 
     TofuAutonomousAlt::HubSettings hub;
     hub.enable = g_Config.hubEnable;
@@ -1529,7 +1541,8 @@ enum class MultiboxEventType : uint8
     QuestAccepted,
     QuestAbandoned,
     TrainerOpened,
-    VendorOpened
+    VendorOpened,
+    GuildBankOpened
 };
 
 struct MultiboxEvent
@@ -1537,11 +1550,12 @@ struct MultiboxEvent
     MultiboxEventType type;
     ObjectGuid main;
     uint32 id = 0;      // quest id
-    ObjectGuid npc;     // trainer or vendor
+    ObjectGuid npc;     // trainer, vendor, or guild bank object
 };
 
 std::mutex g_MultiboxMutex;
 std::vector<MultiboxEvent> g_MultiboxEvents;
+std::unordered_map<ObjectGuid, uint32> g_MultiboxBankTimes;  // world thread only
 
 void QueueMultibox(MultiboxEvent const& event)
 {
@@ -1573,12 +1587,6 @@ std::vector<Player*> MultiboxAltsOf(Player* main)
             alts.push_back(member);
     }
     return alts;
-}
-
-bool QuestOpenTo(Player* alt, Quest const* quest)
-{
-    return alt->SatisfyQuestRace(quest, false) && alt->SatisfyQuestClass(quest, false) &&
-           alt->SatisfyQuestExclusiveGroup(quest, false);
 }
 
 ItemUsage UsageFor(Player* alt, uint32 itemId)
@@ -1641,18 +1649,50 @@ bool HasRoomFor(Player* alt, uint32 itemId, uint32 count)
     return alt->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count) == EQUIP_ERR_OK;
 }
 
+// Every item in the backpack and the equipped bags (not equipped gear, not the bags themselves).
+std::vector<Item*> BagItems(Player* alt)
+{
+    std::vector<Item*> items;
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (Item* item = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            items.push_back(item);
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* pBag = alt->GetBagByPos(bag))
+            for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                if (Item* item = pBag->GetItemByPos(slot))
+                    items.push_back(item);
+    return items;
+}
+
+// Reagents used by the class spells the alt knows.
+std::unordered_set<uint32> ClassReagents(Player* alt)
+{
+    std::unordered_set<uint32> reagents;
+    ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(alt->getClass());
+    if (!classEntry)
+        return reagents;
+
+    for (auto const& [spellId, playerSpell] : alt->GetSpellMap())
+    {
+        if (!playerSpell || playerSpell->State == PLAYERSPELL_REMOVED || !playerSpell->Active)
+            continue;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info || info->SpellFamilyName != classEntry->spellfamily)
+            continue;
+        for (int32 reagent : info->Reagent)
+            if (reagent > 0)
+                reagents.insert(static_cast<uint32>(reagent));
+    }
+    return reagents;
+}
+
 void MultiboxRewardQuest(Player* main, Quest const* quest)
 {
     uint32 const questId = quest->GetQuestId();
     for (Player* alt : MultiboxAltsOf(main))
     {
-        if (!quest->IsRepeatable() && alt->GetQuestRewardStatus(questId))
-            continue;  // done already (kill credit often completes it on its own)
-        if (!QuestOpenTo(alt, quest))
-            continue;
-        bool const timerOk = alt->SatisfyQuestDay(quest, false) && alt->SatisfyQuestWeek(quest, false) &&
-                             alt->SatisfyQuestMonth(quest, false) && alt->SatisfyQuestSeasonal(quest, false);
-        if (quest->IsRepeatable() && !timerOk)
+        // Only a quest the alt has in its log (accepted normally, so prerequisites and level were met).
+        if (alt->FindQuestSlot(questId) >= MAX_QUEST_LOG_SIZE)
             continue;
 
         PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
@@ -1694,14 +1734,13 @@ void MultiboxAcceptQuest(Player* main, Quest const* quest)
     uint32 const questId = quest->GetQuestId();
     for (Player* alt : MultiboxAltsOf(main))
     {
-        if (alt->GetQuestStatus(questId) != QUEST_STATUS_NONE || !QuestOpenTo(alt, quest))
-            continue;
-        if (!quest->IsRepeatable() && alt->GetQuestRewardStatus(questId))
+        // The normal quest-giver rules: level, prerequisites, race, class, reputation, skill, repeat timers.
+        if (!alt->CanTakeQuest(quest, false))
             continue;
 
         if (!alt->CanAddQuest(quest, false))
         {
-            GET_PLAYERBOT_AI(alt)->TellMaster("My quest log is full, so I could not take " +
+            GET_PLAYERBOT_AI(alt)->TellMaster("My quest log or bags are full, so I could not take " +
                                               std::string(quest->GetTitle()) + ".");
             continue;
         }
@@ -1785,23 +1824,26 @@ void MultiboxVendor(Player* main, Creature* npc)
         PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
         bool broke = false;
 
-        // Sell junk and gear it will not use (vendor usage; auction-house usage up to green quality).
+        // Sell grays, and soulbound weapons and armor it cannot use or that are no upgrade over what it wears.
         std::vector<Item*> toSell;
-        auto consider = [&](Item* item)
+        for (Item* item : BagItems(alt))
         {
-            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
-            if (!proto || !proto->SellPrice || proto->Class == ITEM_CLASS_QUEST)
-                return;
-            ItemUsage const usage = UsageFor(alt, proto->ItemId);
-            if (usage == ITEM_USAGE_VENDOR || (usage == ITEM_USAGE_AH && proto->Quality <= ITEM_QUALITY_UNCOMMON))
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto->SellPrice || proto->Class == ITEM_CLASS_QUEST)
+                continue;
+            if (proto->Quality == ITEM_QUALITY_POOR)
+            {
                 toSell.push_back(item);
-        };
-        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-            consider(alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
-        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
-            if (Bag* pBag = alt->GetBagByPos(bag))
-                for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
-                    consider(pBag->GetItemByPos(slot));
+                continue;
+            }
+            bool const gear = (proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_ARMOR) &&
+                              proto->InventoryType != INVTYPE_BODY && proto->InventoryType != INVTYPE_TABARD;
+            if (!gear || !item->IsSoulBound())
+                continue;
+            ItemUsage const usage = UsageFor(alt, proto->ItemId);
+            if (alt->CanUseItem(proto) != EQUIP_ERR_OK || (usage != ITEM_USAGE_EQUIP && usage != ITEM_USAGE_REPLACE))
+                toSell.push_back(item);
+        }
 
         for (Item* item : toSell)
         {
@@ -1826,21 +1868,7 @@ void MultiboxVendor(Player* main, Creature* npc)
 
         // Restock: the best usable ammo for its ranged weapon, and the reagents its class spells use.
         uint32 const ammoSubClass = TofuAutonomousAlt::AmmoSubClassFor(alt);
-        std::unordered_set<uint32> reagents;
-        if (ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(alt->getClass()))
-        {
-            for (auto const& [spellId, playerSpell] : alt->GetSpellMap())
-            {
-                if (!playerSpell || playerSpell->State == PLAYERSPELL_REMOVED || !playerSpell->Active)
-                    continue;
-                SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-                if (!info || info->SpellFamilyName != classEntry->spellfamily)
-                    continue;
-                for (int32 reagent : info->Reagent)
-                    if (reagent > 0)
-                        reagents.insert(static_cast<uint32>(reagent));
-            }
-        }
+        std::unordered_set<uint32> const reagents = ClassReagents(alt);
 
         VendorItem const* bestAmmo = nullptr;
         ItemTemplate const* bestAmmoProto = nullptr;
@@ -1889,6 +1917,72 @@ void MultiboxVendor(Player* main, Creature* npc)
     }
 }
 
+// Deposits every unbound item of white quality or better into the configured guild bank tabs, keeping ammo, class
+// reagents, profession tools, quest items, temporary items, and gear it would equip.
+void MultiboxGuildBank(Player* main)
+{
+    Guild* guild = main->GetGuildId() ? sGuildMgr->GetGuildById(main->GetGuildId()) : nullptr;
+    if (!guild || g_Config.multiboxGuildBankTabs.empty())
+        return;
+
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
+        if (alt->GetGuildId() != main->GetGuildId())
+        {
+            altAI->TellMaster("I am not in your guild, so I cannot use the guild bank.");
+            continue;
+        }
+
+        std::unordered_set<uint32> const reagents = ClassReagents(alt);
+        std::vector<ObjectGuid> toDeposit;
+        for (Item* item : BagItems(alt))
+        {
+            ItemTemplate const* proto = item->GetTemplate();
+            if (proto->Quality < ITEM_QUALITY_NORMAL || item->IsSoulBound() || item->IsBoundAccountWide() ||
+                proto->Class == ITEM_CLASS_QUEST || proto->Class == ITEM_CLASS_PROJECTILE || proto->Duration ||
+                proto->TotemCategory || item->IsConjuredConsumable() || item->IsRefundable() ||
+                reagents.contains(proto->ItemId))
+                continue;
+            ItemUsage const usage = UsageFor(alt, proto->ItemId);
+            if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
+                continue;
+            toDeposit.push_back(item->GetGUID());
+        }
+
+        uint32 failed = 0;
+        for (ObjectGuid const& itemGuid : toDeposit)
+        {
+            bool stored = false;
+            for (uint8 tab : g_Config.multiboxGuildBankTabs)
+            {
+                Item* item = alt->GetItemByGuid(itemGuid);
+                if (!item)
+                {
+                    stored = true;
+                    break;
+                }
+                guild->SwapItemsWithInventory(alt, false, tab, NULL_SLOT, item->GetBagSlot(), item->GetSlot(), 0);
+                if (!alt->GetItemByGuid(itemGuid))
+                {
+                    stored = true;
+                    break;
+                }
+            }
+            if (!stored)
+                ++failed;
+        }
+
+        if (failed)
+            altAI->TellMaster("I could not deposit " + std::to_string(failed) +
+                              " items: the guild bank tabs are full or my rank cannot deposit there.");
+
+        if (g_Config.verboseLogging)
+            LOG_INFO("module", "mod-autonomous-altbots: multibox {} deposited {} of {} items in the guild bank",
+                     alt->GetName(), toDeposit.size() - failed, toDeposit.size());
+    }
+}
+
 void ProcessMultibox()
 {
     std::vector<MultiboxEvent> events;
@@ -1924,6 +2018,19 @@ void ProcessMultibox()
                 if (Creature* npc = ObjectAccessor::GetCreature(*main, event.npc))
                     MultiboxVendor(main, npc);
                 break;
+            case MultiboxEventType::GuildBankOpened:
+            {
+                // Once per opening: the client sends the activation again only when the window is reopened.
+                uint32& last = g_MultiboxBankTimes[event.main];
+                if (last && getMSTimeDiff(last, getMSTime()) < 10 * IN_MILLISECONDS)
+                    break;
+                if (main->GetGameObjectIfCanInteractWith(event.npc, GAMEOBJECT_TYPE_GUILD_BANK))
+                {
+                    last = getMSTime();
+                    MultiboxGuildBank(main);
+                }
+                break;
+            }
         }
     }
 }
@@ -1931,7 +2038,29 @@ void ProcessMultibox()
 class AutonomousAltBotsServerScript : public ServerScript
 {
 public:
-    AutonomousAltBotsServerScript() : ServerScript("AutonomousAltBotsServerScript", { SERVERHOOK_CAN_PACKET_SEND }) { }
+    AutonomousAltBotsServerScript()
+        : ServerScript("AutonomousAltBotsServerScript", { SERVERHOOK_CAN_PACKET_SEND, SERVERHOOK_CAN_PACKET_RECEIVE })
+    {
+    }
+
+    // Any thread: notes that a real player opened the guild bank (CMSG_GUILD_BANKER_ACTIVATE: bank guid, full update).
+    bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+    {
+        if (packet.GetOpcode() != CMSG_GUILD_BANKER_ACTIVATE || !g_Config.multiboxEnable ||
+            !g_Config.multiboxGuildBank || packet.size() < sizeof(uint64))
+            return true;
+
+        Player* player = session ? session->GetPlayer() : nullptr;
+        if (!IsMultiboxMain(player) || !player->GetGuildId())
+            return true;
+
+        MultiboxEvent event;
+        event.type = MultiboxEventType::GuildBankOpened;
+        event.main = player->GetGUID();
+        event.npc = ObjectGuid(packet.read<uint64>(0));
+        QueueMultibox(event);
+        return true;
+    }
 
     // Any thread: only notes that a real player's trainer or vendor window opened.
     bool CanPacketSend(WorldSession* session, WorldPacket const& packet) override
