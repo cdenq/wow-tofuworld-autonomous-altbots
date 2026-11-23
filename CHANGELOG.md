@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.12] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Fixed
+
+- Multibox turn-in: fixed reward items (quests with no choice) that raise the bot's stats are equipped at once too, and named in the whisper; before, only the chosen item was equipped and fixed items waited for playerbots' own gear check.
+
 ## [1.0.1-tofu.11] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Changed

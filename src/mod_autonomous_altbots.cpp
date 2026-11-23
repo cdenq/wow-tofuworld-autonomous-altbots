@@ -1776,20 +1776,37 @@ void MultiboxRewardQuest(Player* main, Quest const* quest)
         // The alt itself stands in for the quest giver (its own spells are cast on itself; mail comes from it).
         alt->RewardQuest(quest, choice, alt, false);
 
+        // Wear the rewards that raise its stats now (the chosen item and any fixed reward items), not at the next
+        // gear check, which also holds each class to one armor type and wants 10% better.
+        StatsWeightCalculator calculator(alt);
+        auto wearIfBetter = [&](ItemTemplate const* proto)
+        {
+            if (!proto || RewardUpgradeGain(alt, altAI, calculator, proto) <= 0.0f)
+                return false;
+            EquipAction(altAI).EquipItems({ proto->ItemId });
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item* worn = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (worn && worn->GetEntry() == proto->ItemId)
+                    return true;
+            }
+            return false;
+        };
+
         uint32 const chosenItem = quest->GetRewChoiceItemsCount() ? quest->RewardChoiceItemId[choice] : 0;
         ItemTemplate const* chosenProto = chosenItem ? sObjectMgr->GetItemTemplate(chosenItem) : nullptr;
-        bool equipped = false;
-        if (chosenProto && upgrade)
-        {
-            EquipAction(altAI).EquipItems({ chosenItem });  // wear it now, not at the next gear check
-            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END && !equipped; ++slot)
-                if (Item* worn = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-                    equipped = worn->GetEntry() == chosenItem;
-        }
+        bool const chosenWorn = upgrade && wearIfBetter(chosenProto);
 
         std::string message = "Turned in " + ChatHelper::FormatQuest(quest);
         if (chosenProto)
-            message += ", took " + ChatHelper::FormatItem(chosenProto) + (equipped ? " and equipped it" : "");
+            message += ", took " + ChatHelper::FormatItem(chosenProto) + (chosenWorn ? " and equipped it" : "");
+        for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
+        {
+            ItemTemplate const* fixed =
+                quest->RewardItemId[i] ? sObjectMgr->GetItemTemplate(quest->RewardItemId[i]) : nullptr;
+            if (fixed && wearIfBetter(fixed))
+                message += ", equipped " + ChatHelper::FormatItem(fixed);
+        }
         altAI->TellMaster(message + ".");
 
         if (g_Config.verboseLogging)
