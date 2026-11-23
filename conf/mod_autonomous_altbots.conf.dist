@@ -146,12 +146,12 @@ AutonomousAltBots.Hub.MaxMinutes = 5
 AutonomousAltBots.Hub.MinIntervalMinutes = 20
 AutonomousAltBots.Hub.ErrandStuckSeconds = 20
 
-# Multibox: a real player's own altbots (enrolled or not), in his group, copy what he does. Quests he accepts are
-# accepted by each bot that could take them from the quest giver (level, prerequisites, and the other normal rules);
-# quests he abandons are abandoned. When he is rewarded for a quest, each bot that has it in its log is completed and
-# rewarded at once, with no looting or travel. Reward choice: the biggest upgrade for the bot, else the one that sells
-# for most. Never buys gear.
-#   Quests        - quest copying (accept, abandon, complete)
+# Multibox: a real player's own altbots (enrolled or not), in his group, follow his turn-ins. Bots get his quests by
+# sharing (for example Jamba's auto-share; the playerbots fork accepts shares and gives the starter item of an
+# item-started quest). When he is rewarded for a quest, each bot that has it in its log is completed and rewarded at
+# once, with no looting or travel, takes the biggest upgrade for itself (else the choice that sells for most), equips an
+# upgrade, and whispers what it turned in and took. Quests he abandons are abandoned. Never buys gear.
+#   Quests        - turn-ins and abandons
 #   Training      - class spells at level-up and at a class trainer he opens; profession ranks at a profession trainer
 #                   he opens, only for professions the bot already has (Self Crafted bots learn their class list)
 #   Vendor        - at a vendor he opens: sell grays and soulbound weapons and armor the bot cannot use or that are no

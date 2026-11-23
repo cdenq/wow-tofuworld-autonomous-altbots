@@ -38,6 +38,7 @@
  */
 
 #include "AccountMgr.h"
+#include "EquipAction.h"
 #include "Timer.h"
 #include "GameObject.h"
 #include "GuildMgr.h"
@@ -1538,7 +1539,6 @@ void RescueStranded(Player* bot)
 enum class MultiboxEventType : uint8
 {
     QuestRewarded,
-    QuestAccepted,
     QuestAbandoned,
     TrainerOpened,
     VendorOpened,
@@ -1598,9 +1598,15 @@ ItemUsage UsageFor(Player* alt, uint32 itemId)
 }
 
 // The reward choice: the biggest upgrade for this alt (playerbots' gear weights), else the one that sells for most.
-uint32 PickQuestReward(Player* alt, Quest const* quest)
+uint32 PickQuestReward(Player* alt, Quest const* quest, bool& upgrade)
 {
+    upgrade = false;
     uint32 const choices = quest->GetRewChoiceItemsCount();
+    if (choices == 1)
+    {
+        ItemUsage const usage = UsageFor(alt, quest->RewardChoiceItemId[0]);
+        upgrade = usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE;
+    }
     if (choices <= 1)
         return 0;
 
@@ -1637,7 +1643,10 @@ uint32 PickQuestReward(Player* alt, Quest const* quest)
     }
 
     if (bestUpgrade >= 0)
+    {
+        upgrade = true;
         return static_cast<uint32>(bestUpgrade);
+    }
     return bestValue >= 0 ? static_cast<uint32>(bestValue) : 0;
 }
 
@@ -1705,7 +1714,8 @@ void MultiboxRewardQuest(Player* main, Quest const* quest)
             continue;
         }
 
-        uint32 const choice = PickQuestReward(alt, quest);
+        bool upgrade = false;
+        uint32 const choice = PickQuestReward(alt, quest, upgrade);
         bool room = quest->GetRewChoiceItemsCount() == 0 ||
                     HasRoomFor(alt, quest->RewardChoiceItemId[choice], quest->RewardChoiceItemCount[choice]);
         for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
@@ -1723,31 +1733,25 @@ void MultiboxRewardQuest(Player* main, Quest const* quest)
         // The alt itself stands in for the quest giver (its own spells are cast on itself; mail comes from it).
         alt->RewardQuest(quest, choice, alt, false);
 
+        uint32 const chosenItem = quest->GetRewChoiceItemsCount() ? quest->RewardChoiceItemId[choice] : 0;
+        ItemTemplate const* chosenProto = chosenItem ? sObjectMgr->GetItemTemplate(chosenItem) : nullptr;
+        bool equipped = false;
+        if (chosenProto && upgrade)
+        {
+            EquipAction(altAI).EquipItems({ chosenItem });  // wear it now, not at the next gear check
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END && !equipped; ++slot)
+                if (Item* worn = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    equipped = worn->GetEntry() == chosenItem;
+        }
+
+        std::string message = "Turned in " + ChatHelper::FormatQuest(quest);
+        if (chosenProto)
+            message += ", took " + ChatHelper::FormatItem(chosenProto) + (equipped ? " and equipped it" : "");
+        altAI->TellMaster(message + ".");
+
         if (g_Config.verboseLogging)
             LOG_INFO("module", "mod-autonomous-altbots: multibox {} completed quest {} with {}", alt->GetName(),
                      questId, main->GetName());
-    }
-}
-
-void MultiboxAcceptQuest(Player* main, Quest const* quest)
-{
-    uint32 const questId = quest->GetQuestId();
-    for (Player* alt : MultiboxAltsOf(main))
-    {
-        // The normal quest-giver rules: level, prerequisites, race, class, reputation, skill, repeat timers.
-        if (!alt->CanTakeQuest(quest, false))
-            continue;
-
-        if (!alt->CanAddQuest(quest, false))
-        {
-            GET_PLAYERBOT_AI(alt)->TellMaster("My quest log or bags are full, so I could not take " +
-                                              std::string(quest->GetTitle()) + ".");
-            continue;
-        }
-
-        alt->AddQuest(quest, nullptr);
-        if (alt->CanCompleteQuest(questId))
-            alt->CompleteQuest(questId);
     }
 }
 
@@ -2003,10 +2007,6 @@ void ProcessMultibox()
                 if (Quest const* quest = sObjectMgr->GetQuestTemplate(event.id))
                     MultiboxRewardQuest(main, quest);
                 break;
-            case MultiboxEventType::QuestAccepted:
-                if (Quest const* quest = sObjectMgr->GetQuestTemplate(event.id))
-                    MultiboxAcceptQuest(main, quest);
-                break;
             case MultiboxEventType::QuestAbandoned:
                 MultiboxAbandonQuest(main, event.id);
                 break;
@@ -2259,8 +2259,7 @@ public:
     AutonomousAltBotsPlayerScript()
         : PlayerScript("AutonomousAltBotsPlayerScript",
                        { PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_CAN_GROUP_INVITE, PLAYERHOOK_ON_DELETE_FROM_DB,
-                         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
-                         PLAYERHOOK_ON_QUEST_ABANDON })
+                         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_QUEST_ABANDON })
     {
     }
 
@@ -2269,12 +2268,6 @@ public:
     {
         if (g_Config.multiboxQuests && quest && IsMultiboxMain(player))
             QueueMultibox({ MultiboxEventType::QuestRewarded, player->GetGUID(), quest->GetQuestId(), {} });
-    }
-
-    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
-    {
-        if (g_Config.multiboxQuests && quest && IsMultiboxMain(player))
-            QueueMultibox({ MultiboxEventType::QuestAccepted, player->GetGUID(), quest->GetQuestId(), {} });
     }
 
     void OnPlayerQuestAbandon(Player* player, uint32 questId) override

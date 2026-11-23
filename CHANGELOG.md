@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.8] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Multibox quests: accepts are no longer copied (bots get quests by sharing, which the playerbots fork now accepts). Turn-ins whisper the quest and the reward taken, and an upgrade is equipped at once.
+
 ## [1.0.1-tofu.7] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Changed
