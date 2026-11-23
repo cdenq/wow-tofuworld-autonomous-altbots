@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.11] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Multibox reward choice: by stats alone, as the biggest gain in stat score over what is worn in that slot (the weaker ring or trinket slot), for any armor type the bot can wear, so a caster druid takes cloth with intellect over leather with stamina. Challenge-mode gear rules still apply. Else the choice that sells for most.
+
 ## [1.0.1-tofu.10] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Changed

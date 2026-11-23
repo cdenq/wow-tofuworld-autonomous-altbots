@@ -1597,22 +1597,69 @@ ItemUsage UsageFor(Player* alt, uint32 itemId)
     return altAI->GetAiObjectContext()->GetValue<ItemUsage>("item usage", std::to_string(itemId))->Get();
 }
 
-// The reward choice: the biggest upgrade for this alt (playerbots' gear weights), else the one that sells for most.
+// How much a reward item would raise this alt's stat score (playerbots' weights for its class, spec, and role) over
+// what it wears in that slot, by stats alone: any armor type it can wear counts (a caster druid weighs cloth with
+// intellect against leather with stamina), unlike playerbots' own gear check, which keeps each class to one armor type.
+// 0 when it cannot wear the item (level, proficiency, class, challenge-mode gear rules) or it is no improvement.
+float RewardUpgradeGain(Player* alt, PlayerbotAI* altAI, StatsWeightCalculator& calculator, ItemTemplate const* proto)
+{
+    if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON)
+        return 0.0f;
+    if (proto->InventoryType == INVTYPE_BODY || proto->InventoryType == INVTYPE_TABARD)
+        return 0.0f;
+    if (alt->CanUseItem(proto) != EQUIP_ERR_OK)
+        return 0.0f;
+
+    Item* test = Item::CreateItem(proto->ItemId, 1, alt);
+    if (!test)
+        return 0.0f;
+    uint16 dest = 0;
+    bool const wearable = altAI->CanEquipItem(NULL_SLOT, dest, test, true, true) == EQUIP_ERR_OK;
+    test->RemoveFromUpdateQueueOf(alt);
+    delete test;
+    if (!wearable)
+        return 0.0f;
+
+    uint8 const slot = altAI->FindEquipSlot(proto, NULL_SLOT, true);
+    if (slot == NULL_SLOT)
+        return 0.0f;
+
+    // Rings, trinkets, and one-handers for a dual wielder replace the weaker of their two slots.
+    std::vector<uint8> slots = { slot };
+    if (slot == EQUIPMENT_SLOT_FINGER1 || slot == EQUIPMENT_SLOT_FINGER2)
+        slots = { EQUIPMENT_SLOT_FINGER1, EQUIPMENT_SLOT_FINGER2 };
+    else if (slot == EQUIPMENT_SLOT_TRINKET1 || slot == EQUIPMENT_SLOT_TRINKET2)
+        slots = { EQUIPMENT_SLOT_TRINKET1, EQUIPMENT_SLOT_TRINKET2 };
+    else if (slot == EQUIPMENT_SLOT_MAINHAND && alt->CanDualWield() && proto->InventoryType != INVTYPE_2HWEAPON &&
+             proto->InventoryType != INVTYPE_WEAPONMAINHAND)
+        slots = { EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND };
+
+    float worn = -1.0f;
+    for (uint8 s : slots)
+    {
+        Item* current = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, s);
+        float const score = current ? calculator.CalculateItem(current->GetEntry(), current->GetItemRandomPropertyId())
+                                    : 0.0f;
+        if (worn < 0.0f || score < worn)
+            worn = score;
+    }
+
+    float const gain = calculator.CalculateItem(proto->ItemId) - std::max(worn, 0.0f);
+    return gain > 0.0f ? gain : 0.0f;
+}
+
+// The reward choice: the biggest stat improvement for this alt, else the one that sells for most.
 uint32 PickQuestReward(Player* alt, Quest const* quest, bool& upgrade)
 {
     upgrade = false;
     uint32 const choices = quest->GetRewChoiceItemsCount();
-    if (choices == 1)
-    {
-        ItemUsage const usage = UsageFor(alt, quest->RewardChoiceItemId[0]);
-        upgrade = usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE;
-    }
-    if (choices <= 1)
+    if (!choices)
         return 0;
 
+    PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
     StatsWeightCalculator calculator(alt);
     int32 bestUpgrade = -1;
-    float bestScore = 0.0f;
+    float bestGain = 0.0f;
     int32 bestValue = -1;
     uint32 bestPrice = 0;
 
@@ -1623,15 +1670,11 @@ uint32 PickQuestReward(Player* alt, Quest const* quest, bool& upgrade)
         if (!proto)
             continue;
 
-        ItemUsage const usage = UsageFor(alt, itemId);
-        if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
+        float const gain = altAI ? RewardUpgradeGain(alt, altAI, calculator, proto) : 0.0f;
+        if (gain > bestGain)
         {
-            float const score = calculator.CalculateItem(itemId);
-            if (bestUpgrade < 0 || score > bestScore)
-            {
-                bestUpgrade = static_cast<int32>(i);
-                bestScore = score;
-            }
+            bestUpgrade = static_cast<int32>(i);
+            bestGain = gain;
         }
 
         uint32 const price = proto->SellPrice * std::max<uint32>(quest->RewardChoiceItemCount[i], 1);
