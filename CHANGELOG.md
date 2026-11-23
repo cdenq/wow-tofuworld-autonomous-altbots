@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.10] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Changed
+
+- Multibox vendor: bots also sell white-quality weapons and armor (bound or not) that they cannot use or that are no upgrade.
+
 ## [1.0.1-tofu.9] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Changed

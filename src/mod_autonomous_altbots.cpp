@@ -1828,7 +1828,8 @@ void MultiboxVendor(Player* main, Creature* npc)
         PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
         bool broke = false;
 
-        // Sell grays, and soulbound weapons and armor it cannot use or that are no upgrade over what it wears.
+        // Sell grays, and weapons and armor that are soulbound or white quality and that it cannot use or that are no
+        // upgrade over what it wears. Unbound green-or-better gear is kept for the guild bank.
         std::vector<Item*> toSell;
         for (Item* item : BagItems(alt))
         {
@@ -1842,7 +1843,7 @@ void MultiboxVendor(Player* main, Creature* npc)
             }
             bool const gear = (proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_ARMOR) &&
                               proto->InventoryType != INVTYPE_BODY && proto->InventoryType != INVTYPE_TABARD;
-            if (!gear || !item->IsSoulBound())
+            if (!gear || (!item->IsSoulBound() && proto->Quality != ITEM_QUALITY_NORMAL))
                 continue;
             ItemUsage const usage = UsageFor(alt, proto->ItemId);
             if (alt->CanUseItem(proto) != EQUIP_ERR_OK || (usage != ITEM_USAGE_EQUIP && usage != ITEM_USAGE_REPLACE))
