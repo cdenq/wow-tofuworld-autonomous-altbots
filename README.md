@@ -47,6 +47,7 @@ with stock AzerothCore without the Playerbots fork and `mod-playerbots`.
 - Rejects random-bot and add-class accounts to avoid lifecycle conflicts.
 - Handles an in-flight login when an administrator disables a character.
 - GM and console commands for starting, stopping, listing, inspecting, and reloading selections.
+- Multibox (`AutonomousAltBots.Multibox.*`): a real player's own altbots in his group complete and are rewarded for every quest he is rewarded for, copy his quest accepts and abandons, train when he opens a trainer, and sell, repair, and restock ammo and reagents when he opens a vendor.
 
 ## Existing related functionality
 

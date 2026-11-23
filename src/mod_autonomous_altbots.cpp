@@ -38,6 +38,15 @@
  */
 
 #include "AccountMgr.h"
+#include "QuestDef.h"
+#include "Creature.h"
+#include "Trainer.h"
+#include "StatsWeightCalculator.h"
+#include "SpellMgr.h"
+#include "SpellInfo.h"
+#include "ItemUsageValue.h"
+#include "ChatHelper.h"
+#include "Bag.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "CommandScript.h"
@@ -125,6 +134,14 @@ struct AutonomousAltConfig
     bool hubEnable = false;
     uint32 hubMaxMs = 5 * MINUTE * IN_MILLISECONDS;
     uint32 hubMinIntervalMs = 20 * MINUTE * IN_MILLISECONDS;
+
+    // Multibox: a real player's own altbots in his group copy his quests, training, and vendor visits.
+    bool multiboxEnable = false;
+    bool multiboxQuests = true;
+    bool multiboxTraining = true;
+    bool multiboxVendor = true;
+    uint32 multiboxAmmoTarget = 1000;
+    uint32 multiboxReagentTarget = 20;
 };
 
 // Party activity, kept in memory (world thread).
@@ -297,6 +314,13 @@ void LoadConfig()
     g_Config.hubMinIntervalMs =
         sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.MinIntervalMinutes", 20) * MINUTE * IN_MILLISECONDS;
 
+    g_Config.multiboxEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Enable", false);
+    g_Config.multiboxQuests = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Quests", true);
+    g_Config.multiboxTraining = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Training", true);
+    g_Config.multiboxVendor = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Vendor", true);
+    g_Config.multiboxAmmoTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.AmmoTarget", 1000);
+    g_Config.multiboxReagentTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.ReagentTarget", 20);
+
     TofuAutonomousAlt::HubSettings hub;
     hub.enable = g_Config.hubEnable;
     hub.mapId = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.Map", 1);
@@ -325,6 +349,8 @@ void LoadConfig()
     settings.partyPresentRange = sConfigMgr->GetOption<float>("AutonomousAltBots.Party.PresentRange", 100.0f);
     settings.restockBagPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.BagPct", 50.0f);
     settings.restockDurabilityPct = sConfigMgr->GetOption<float>("AutonomousAltBots.Hub.DurabilityPct", 25.0f);
+    settings.multiboxEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Enable", false);
+    settings.multiboxTraining = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Training", true);
     TofuAutonomousAlt::SetSettings(settings);
 }
 
@@ -1487,6 +1513,453 @@ void RescueStranded(Player* bot)
         TeleportHome(bot);
 }
 
+
+// ---- Multibox: a real player's own altbots in his group ----
+//
+// Quests he is rewarded for are force-completed and rewarded for each of them (no looting or travel; prerequisites and
+// level are not checked, race, class, exclusive groups, and repeat timers are); quests he accepts or abandons are
+// accepted or abandoned too; opening a trainer teaches them their class spells or the ranks of that profession (only
+// professions they already have); opening a vendor makes them sell junk and gear they will not use, repair, and
+// restock ammo and class reagents. They never buy gear. The hooks fire on map threads, so they queue events that the
+// world thread applies.
+
+enum class MultiboxEventType : uint8
+{
+    QuestRewarded,
+    QuestAccepted,
+    QuestAbandoned,
+    TrainerOpened,
+    VendorOpened
+};
+
+struct MultiboxEvent
+{
+    MultiboxEventType type;
+    ObjectGuid main;
+    uint32 id = 0;      // quest id
+    ObjectGuid npc;     // trainer or vendor
+};
+
+std::mutex g_MultiboxMutex;
+std::vector<MultiboxEvent> g_MultiboxEvents;
+
+void QueueMultibox(MultiboxEvent const& event)
+{
+    std::lock_guard lock(g_MultiboxMutex);
+    g_MultiboxEvents.push_back(event);
+}
+
+bool IsMultiboxMain(Player* player)
+{
+    return g_Config.multiboxEnable && player && player->GetGroup() && IsRealPlayer(player) &&
+           !TofuAutonomousAlt::IsActive(player);
+}
+
+std::vector<Player*> MultiboxAltsOf(Player* main)
+{
+    std::vector<Player*> alts;
+    Group* group = main->GetGroup();
+    if (!group)
+        return alts;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == main || !member->IsInWorld() || !IsPlayerbot(member))
+            continue;
+
+        PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member);
+        if (memberAI && memberAI->GetMaster() == main && TofuAutonomousAlt::IsMultiboxAlt(member))
+            alts.push_back(member);
+    }
+    return alts;
+}
+
+bool QuestOpenTo(Player* alt, Quest const* quest)
+{
+    return alt->SatisfyQuestRace(quest, false) && alt->SatisfyQuestClass(quest, false) &&
+           alt->SatisfyQuestExclusiveGroup(quest, false);
+}
+
+ItemUsage UsageFor(Player* alt, uint32 itemId)
+{
+    PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
+    if (!altAI)
+        return ITEM_USAGE_NONE;
+    return altAI->GetAiObjectContext()->GetValue<ItemUsage>("item usage", std::to_string(itemId))->Get();
+}
+
+// The reward choice: the biggest upgrade for this alt (playerbots' gear weights), else the one that sells for most.
+uint32 PickQuestReward(Player* alt, Quest const* quest)
+{
+    uint32 const choices = quest->GetRewChoiceItemsCount();
+    if (choices <= 1)
+        return 0;
+
+    StatsWeightCalculator calculator(alt);
+    int32 bestUpgrade = -1;
+    float bestScore = 0.0f;
+    int32 bestValue = -1;
+    uint32 bestPrice = 0;
+
+    for (uint32 i = 0; i < QUEST_REWARD_CHOICES_COUNT; ++i)
+    {
+        uint32 const itemId = quest->RewardChoiceItemId[i];
+        ItemTemplate const* proto = itemId ? sObjectMgr->GetItemTemplate(itemId) : nullptr;
+        if (!proto)
+            continue;
+
+        ItemUsage const usage = UsageFor(alt, itemId);
+        if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
+        {
+            float const score = calculator.CalculateItem(itemId);
+            if (bestUpgrade < 0 || score > bestScore)
+            {
+                bestUpgrade = static_cast<int32>(i);
+                bestScore = score;
+            }
+        }
+
+        uint32 const price = proto->SellPrice * std::max<uint32>(quest->RewardChoiceItemCount[i], 1);
+        if (bestValue < 0 || price > bestPrice)
+        {
+            bestValue = static_cast<int32>(i);
+            bestPrice = price;
+        }
+    }
+
+    if (bestUpgrade >= 0)
+        return static_cast<uint32>(bestUpgrade);
+    return bestValue >= 0 ? static_cast<uint32>(bestValue) : 0;
+}
+
+bool HasRoomFor(Player* alt, uint32 itemId, uint32 count)
+{
+    if (!itemId || !count)
+        return true;
+    ItemPosCountVec dest;
+    return alt->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, count) == EQUIP_ERR_OK;
+}
+
+void MultiboxRewardQuest(Player* main, Quest const* quest)
+{
+    uint32 const questId = quest->GetQuestId();
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        if (!quest->IsRepeatable() && alt->GetQuestRewardStatus(questId))
+            continue;  // done already (kill credit often completes it on its own)
+        if (!QuestOpenTo(alt, quest))
+            continue;
+        bool const timerOk = alt->SatisfyQuestDay(quest, false) && alt->SatisfyQuestWeek(quest, false) &&
+                             alt->SatisfyQuestMonth(quest, false) && alt->SatisfyQuestSeasonal(quest, false);
+        if (quest->IsRepeatable() && !timerOk)
+            continue;
+
+        PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
+        std::string const questName = quest->GetTitle();
+
+        if (quest->GetRewOrReqMoney() < 0 && !alt->HasEnoughMoney(-quest->GetRewOrReqMoney()))
+        {
+            altAI->TellMaster("I need " + ChatHelper::formatMoney(-quest->GetRewOrReqMoney()) + " to complete " +
+                              questName + ".");
+            continue;
+        }
+
+        uint32 const choice = PickQuestReward(alt, quest);
+        bool room = quest->GetRewChoiceItemsCount() == 0 ||
+                    HasRoomFor(alt, quest->RewardChoiceItemId[choice], quest->RewardChoiceItemCount[choice]);
+        for (uint32 i = 0; i < QUEST_REWARDS_COUNT; ++i)
+            room = room && HasRoomFor(alt, quest->RewardItemId[i], quest->RewardItemIdCount[i]);
+        if (!room)
+        {
+            altAI->TellMaster("My bags are full, so I could not complete " + questName + ".");
+            continue;
+        }
+
+        QuestStatus const status = alt->GetQuestStatus(questId);
+        if (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_FAILED)
+            alt->CompleteQuest(questId);
+
+        // The alt itself stands in for the quest giver (its own spells are cast on itself; mail comes from it).
+        alt->RewardQuest(quest, choice, alt, false);
+
+        if (g_Config.verboseLogging)
+            LOG_INFO("module", "mod-autonomous-altbots: multibox {} completed quest {} with {}", alt->GetName(),
+                     questId, main->GetName());
+    }
+}
+
+void MultiboxAcceptQuest(Player* main, Quest const* quest)
+{
+    uint32 const questId = quest->GetQuestId();
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        if (alt->GetQuestStatus(questId) != QUEST_STATUS_NONE || !QuestOpenTo(alt, quest))
+            continue;
+        if (!quest->IsRepeatable() && alt->GetQuestRewardStatus(questId))
+            continue;
+
+        if (!alt->CanAddQuest(quest, false))
+        {
+            GET_PLAYERBOT_AI(alt)->TellMaster("My quest log is full, so I could not take " +
+                                              std::string(quest->GetTitle()) + ".");
+            continue;
+        }
+
+        alt->AddQuest(quest, nullptr);
+        if (alt->CanCompleteQuest(questId))
+            alt->CompleteQuest(questId);
+    }
+}
+
+void MultiboxAbandonQuest(Player* main, uint32 questId)
+{
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        if (alt->FindQuestSlot(questId) >= MAX_QUEST_LOG_SIZE)
+            continue;
+
+        if (!alt->TakeQuestSourceItem(questId, false))
+            continue;
+        alt->AbandonQuest(questId);
+        alt->RemoveActiveQuest(questId);
+        alt->RemoveTimedAchievement(ACHIEVEMENT_TIMED_TYPE_QUEST, questId);
+    }
+}
+
+void MultiboxTrainer(Player* main, Creature* npc)
+{
+    Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(npc->GetEntry());
+    if (!trainer)
+        return;
+
+    bool const classTrainer = trainer->GetTrainerType() == Trainer::Type::Class;
+    uint32 const skill = classTrainer ? 0 : TofuAutonomousAlt::TrainerProfessionSkill(npc);
+    if (!classTrainer && !skill)
+        return;
+
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        uint32 shortfall = 0;
+        if (classTrainer)
+            TofuAutonomousAlt::LearnClassTrainerSpells(alt, &shortfall);
+        else if (alt->HasSkill(skill) || TofuAutonomousAlt::IsSelfCrafted(alt))
+            TofuAutonomousAlt::LearnProfessions(alt, npc, &shortfall);  // never starts a new profession
+        else
+            continue;
+
+        if (shortfall)
+            GET_PLAYERBOT_AI(alt)->TellMaster("I need " + ChatHelper::formatMoney(shortfall) + " more to train" +
+                                               (classTrainer ? " my spells." : " my profession."));
+    }
+}
+
+// Buys `units` purchases of a vendor item without walking there (the alt pays the list price).
+uint32 MultiboxBuy(Player* alt, VendorItem const* vendorItem, ItemTemplate const* proto, uint32 units, bool& broke)
+{
+    uint32 bought = 0;
+    uint32 const perBuy = std::max<uint32>(proto->BuyCount, 1);
+    for (uint32 i = 0; i < units; ++i)
+    {
+        if (proto->BuyPrice && !alt->HasEnoughMoney(proto->BuyPrice))
+        {
+            broke = true;
+            break;
+        }
+        if (!HasRoomFor(alt, vendorItem->item, perBuy) || !alt->StoreNewItemInBestSlots(vendorItem->item, perBuy))
+            break;
+        alt->ModifyMoney(-static_cast<int32>(proto->BuyPrice));
+        ++bought;
+    }
+    return bought;
+}
+
+void MultiboxVendor(Player* main, Creature* npc)
+{
+    uint32 const currentList = main->GetSession()->GetCurrentVendor();
+    VendorItemData const* items =
+        currentList ? sObjectMgr->GetNpcVendorItemList(currentList) : npc->GetVendorItems();
+
+    for (Player* alt : MultiboxAltsOf(main))
+    {
+        PlayerbotAI* altAI = GET_PLAYERBOT_AI(alt);
+        bool broke = false;
+
+        // Sell junk and gear it will not use (vendor usage; auction-house usage up to green quality).
+        std::vector<Item*> toSell;
+        auto consider = [&](Item* item)
+        {
+            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            if (!proto || !proto->SellPrice || proto->Class == ITEM_CLASS_QUEST)
+                return;
+            ItemUsage const usage = UsageFor(alt, proto->ItemId);
+            if (usage == ITEM_USAGE_VENDOR || (usage == ITEM_USAGE_AH && proto->Quality <= ITEM_QUALITY_UNCOMMON))
+                toSell.push_back(item);
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            consider(alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            if (Bag* pBag = alt->GetBagByPos(bag))
+                for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                    consider(pBag->GetItemByPos(slot));
+
+        for (Item* item : toSell)
+        {
+            alt->ModifyMoney(static_cast<int32>(item->GetTemplate()->SellPrice * item->GetCount()));
+            alt->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+        }
+
+        // Repair.
+        alt->DurabilityRepairAll(true, 1.0f, false);
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* item = alt->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (item && item->GetUInt32Value(ITEM_FIELD_DURABILITY) < item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY))
+            {
+                altAI->TellMaster("I do not have enough gold to repair all my gear.");
+                break;
+            }
+        }
+
+        if (!items)
+            continue;
+
+        // Restock: the best usable ammo for its ranged weapon, and the reagents its class spells use.
+        uint32 const ammoSubClass = TofuAutonomousAlt::AmmoSubClassFor(alt);
+        std::unordered_set<uint32> reagents;
+        if (ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(alt->getClass()))
+        {
+            for (auto const& [spellId, playerSpell] : alt->GetSpellMap())
+            {
+                if (!playerSpell || playerSpell->State == PLAYERSPELL_REMOVED || !playerSpell->Active)
+                    continue;
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+                if (!info || info->SpellFamilyName != classEntry->spellfamily)
+                    continue;
+                for (int32 reagent : info->Reagent)
+                    if (reagent > 0)
+                        reagents.insert(static_cast<uint32>(reagent));
+            }
+        }
+
+        VendorItem const* bestAmmo = nullptr;
+        ItemTemplate const* bestAmmoProto = nullptr;
+        for (VendorItem const* vendorItem : items->m_items)
+        {
+            if (!vendorItem || vendorItem->ExtendedCost || vendorItem->maxcount)
+                continue;
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(vendorItem->item);
+            if (!proto || alt->CanUseItem(proto) != EQUIP_ERR_OK)
+                continue;
+
+            bool const betterAmmo = !bestAmmoProto || proto->ItemLevel > bestAmmoProto->ItemLevel;
+            if (ammoSubClass && proto->Class == ITEM_CLASS_PROJECTILE && proto->SubClass == ammoSubClass &&
+                proto->RequiredLevel <= alt->GetLevel() && betterAmmo)
+            {
+                bestAmmo = vendorItem;
+                bestAmmoProto = proto;
+            }
+
+            if (reagents.contains(proto->ItemId))
+            {
+                uint32 const have = alt->GetItemCount(proto->ItemId, false);
+                uint32 const target = std::min<uint32>(g_Config.multiboxReagentTarget, proto->GetMaxStackSize());
+                if (have < target)
+                {
+                    uint32 const perBuy = std::max<uint32>(proto->BuyCount, 1);
+                    MultiboxBuy(alt, vendorItem, proto, (target - have + perBuy - 1) / perBuy, broke);
+                }
+            }
+        }
+
+        if (bestAmmo)
+        {
+            uint32 const have = alt->GetItemCount(bestAmmoProto->ItemId, false);
+            if (have < g_Config.multiboxAmmoTarget)
+            {
+                uint32 const perBuy = std::max<uint32>(bestAmmoProto->BuyCount, 1);
+                if (MultiboxBuy(alt, bestAmmo, bestAmmoProto,
+                                (g_Config.multiboxAmmoTarget - have + perBuy - 1) / perBuy, broke))
+                    alt->SetAmmo(bestAmmoProto->ItemId);
+            }
+        }
+
+        if (broke)
+            altAI->TellMaster("I do not have enough gold to restock.");
+    }
+}
+
+void ProcessMultibox()
+{
+    std::vector<MultiboxEvent> events;
+    {
+        std::lock_guard lock(g_MultiboxMutex);
+        events.swap(g_MultiboxEvents);
+    }
+
+    for (MultiboxEvent const& event : events)
+    {
+        Player* main = ObjectAccessor::FindPlayer(event.main);
+        if (!IsMultiboxMain(main) || !main->IsInWorld())
+            continue;
+
+        switch (event.type)
+        {
+            case MultiboxEventType::QuestRewarded:
+                if (Quest const* quest = sObjectMgr->GetQuestTemplate(event.id))
+                    MultiboxRewardQuest(main, quest);
+                break;
+            case MultiboxEventType::QuestAccepted:
+                if (Quest const* quest = sObjectMgr->GetQuestTemplate(event.id))
+                    MultiboxAcceptQuest(main, quest);
+                break;
+            case MultiboxEventType::QuestAbandoned:
+                MultiboxAbandonQuest(main, event.id);
+                break;
+            case MultiboxEventType::TrainerOpened:
+                if (Creature* npc = ObjectAccessor::GetCreature(*main, event.npc))
+                    MultiboxTrainer(main, npc);
+                break;
+            case MultiboxEventType::VendorOpened:
+                if (Creature* npc = ObjectAccessor::GetCreature(*main, event.npc))
+                    MultiboxVendor(main, npc);
+                break;
+        }
+    }
+}
+
+class AutonomousAltBotsServerScript : public ServerScript
+{
+public:
+    AutonomousAltBotsServerScript() : ServerScript("AutonomousAltBotsServerScript", { SERVERHOOK_CAN_PACKET_SEND }) { }
+
+    // Any thread: only notes that a real player's trainer or vendor window opened.
+    bool CanPacketSend(WorldSession* session, WorldPacket const& packet) override
+    {
+        uint16 const opcode = packet.GetOpcode();
+        if (opcode != SMSG_TRAINER_LIST && opcode != SMSG_LIST_INVENTORY)
+            return true;
+
+        if (!g_Config.multiboxEnable || packet.size() < sizeof(uint64))
+            return true;
+
+        Player* player = session ? session->GetPlayer() : nullptr;
+        if (!IsMultiboxMain(player))
+            return true;
+
+        bool const trainer = opcode == SMSG_TRAINER_LIST;
+        if ((trainer && !g_Config.multiboxTraining) || (!trainer && !g_Config.multiboxVendor))
+            return true;
+
+        MultiboxEvent event;
+        event.type = trainer ? MultiboxEventType::TrainerOpened : MultiboxEventType::VendorOpened;
+        event.main = player->GetGUID();
+        event.npc = ObjectGuid(packet.read<uint64>(0));
+        QueueMultibox(event);
+        return true;
+    }
+};
+
 class AutonomousAltBotsWorldScript : public WorldScript
 {
 public:
@@ -1524,6 +1997,7 @@ public:
     {
         ProcessStopWatch(diff);
         ProcessHardcoreDeaths();
+        ProcessMultibox();
 
         if (!g_Config.enabled || !PlayerSettingsEnabled())
             return;
@@ -1655,8 +2129,29 @@ class AutonomousAltBotsPlayerScript : public PlayerScript
 public:
     AutonomousAltBotsPlayerScript()
         : PlayerScript("AutonomousAltBotsPlayerScript",
-                       { PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_CAN_GROUP_INVITE, PLAYERHOOK_ON_DELETE_FROM_DB })
+                       { PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_CAN_GROUP_INVITE, PLAYERHOOK_ON_DELETE_FROM_DB,
+                         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
+                         PLAYERHOOK_ON_QUEST_ABANDON })
     {
+    }
+
+    // Map threads: the multibox main's quest changes are queued for the world thread.
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        if (g_Config.multiboxQuests && quest && IsMultiboxMain(player))
+            QueueMultibox({ MultiboxEventType::QuestRewarded, player->GetGUID(), quest->GetQuestId(), {} });
+    }
+
+    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
+    {
+        if (g_Config.multiboxQuests && quest && IsMultiboxMain(player))
+            QueueMultibox({ MultiboxEventType::QuestAccepted, player->GetGUID(), quest->GetQuestId(), {} });
+    }
+
+    void OnPlayerQuestAbandon(Player* player, uint32 questId) override
+    {
+        if (g_Config.multiboxQuests && IsMultiboxMain(player))
+            QueueMultibox({ MultiboxEventType::QuestAbandoned, player->GetGUID(), questId, {} });
     }
 
     // World thread (CMSG_GROUP_INVITE is thread-unsafe). The core refuses an invite to anyone already in a group, and
@@ -2182,6 +2677,7 @@ public:
 void Addmod_autonomous_altbotsScripts()
 {
     new AutonomousAltBotsWorldScript();
+    new AutonomousAltBotsServerScript();
     new AutonomousAltBotsPlayerScript();
     new AutonomousAltBotsCommandScript();
 }

@@ -146,5 +146,23 @@ AutonomousAltBots.Hub.MaxMinutes = 5
 AutonomousAltBots.Hub.MinIntervalMinutes = 20
 AutonomousAltBots.Hub.ErrandStuckSeconds = 20
 
+# Multibox: a real player's own altbots (enrolled or not), in his group, copy what he does. Quests he is rewarded for are
+# completed and rewarded for them at once, with no looting or travel (prerequisites and level are not checked; race,
+# class, exclusive groups, and repeat timers are). Reward choice: the biggest upgrade for the bot, else the one that
+# sells for most. Quests he accepts or abandons are accepted or abandoned too. Never buys gear.
+#   Quests        - quest copying (accept, abandon, complete)
+#   Training      - class spells at level-up and at a class trainer he opens; profession ranks at a profession trainer
+#                   he opens, only for professions the bot already has (Self Crafted bots learn their class list)
+#   Vendor        - at a vendor he opens: sell junk and gear the bot will not use, repair, buy ammo and class reagents
+#   AmmoTarget    - hunters top up to this many of the best ammo the vendor sells
+#   ReagentTarget - top up each class reagent to this many (capped at one stack)
+# Bots whisper him when they lack gold, bag space, or quest log room.
+AutonomousAltBots.Multibox.Enable = 0
+AutonomousAltBots.Multibox.Quests = 1
+AutonomousAltBots.Multibox.Training = 1
+AutonomousAltBots.Multibox.Vendor = 1
+AutonomousAltBots.Multibox.AmmoTarget = 1000
+AutonomousAltBots.Multibox.ReagentTarget = 20
+
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0

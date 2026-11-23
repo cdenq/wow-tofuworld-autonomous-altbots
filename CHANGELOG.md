@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.6] - 2026-11-23 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- Multibox (`AutonomousAltBots.Multibox.*`, off by default): a real player's own altbots in his group copy him. When he is rewarded for a quest, each of them is completed and rewarded for it at once (any objective type; prerequisites and level skipped; race, class, exclusive group, and repeat timers kept), taking the biggest upgrade among the reward choices, else the one that sells for most. Quests he accepts or abandons are accepted or abandoned too. They train class spells at level-up and at class trainers he opens, and profession ranks only for professions they already have; at vendors he opens they sell junk and unused gear, repair, and buy ammo and class reagents, never gear. They whisper him when short of gold, bag space, or quest log room. Needs playerbots fork `TofuAutonomousAlt::IsMultiboxAlt`.
+
 ## [1.0.1-tofu.5] - 2026-11-22 (Tofu Worldview fork, branch tofu)
 
 ### Added
