@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.13] - 2026-11-24 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- Multibox `AutonomousAltBots.Multibox.ConsumableKeep` (default 20): bots keep at most that many of each usable consumable; the excess is sold at a vendor the main opens (when it has a sell price) or deposited at the guild bank.
+
 ## [1.0.1-tofu.12] - 2026-11-23 (Tofu Worldview fork, branch tofu)
 
 ### Fixed

@@ -149,6 +149,7 @@ struct AutonomousAltConfig
     uint32 multiboxReagentTarget = 20;
     bool multiboxGuildBank = true;
     std::vector<uint8> multiboxGuildBankTabs = { 0, 1 };  // guild bank tabs (0 = first) tried in this order
+    uint32 multiboxConsumableKeep = 20;                   // usable consumables kept per item; 0 = no limit
 };
 
 // Party activity, kept in memory (world thread).
@@ -328,6 +329,7 @@ void LoadConfig()
     g_Config.multiboxAmmoTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.AmmoTarget", 1000);
     g_Config.multiboxReagentTarget = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.ReagentTarget", 20);
     g_Config.multiboxGuildBank = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.GuildBank", true);
+    g_Config.multiboxConsumableKeep = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Multibox.ConsumableKeep", 20);
     g_Config.multiboxGuildBankTabs.clear();
     std::string const bankTabs = sConfigMgr->GetOption<std::string>("AutonomousAltBots.Multibox.GuildBankTabs", "1,2");
     for (std::string_view token : Acore::Tokenize(bankTabs, ',', false))
@@ -1738,6 +1740,32 @@ std::unordered_set<uint32> ClassReagents(Player* alt)
     return reagents;
 }
 
+// A consumable the alt can use (potions, healthstones, food, drink, elixirs, flasks, scrolls), of which it keeps only
+// ConsumableKeep per item (conjured items are left alone: they cannot be sold or banked).
+bool IsKeptConsumable(Player* alt, Item* item)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    return proto->Class == ITEM_CLASS_CONSUMABLE && !item->IsConjuredConsumable() &&
+           alt->CanUseItem(proto) == EQUIP_ERR_OK;
+}
+
+// How many of each kept consumable the alt holds beyond ConsumableKeep.
+std::unordered_map<uint32, uint32> ConsumableExcess(Player* alt)
+{
+    std::unordered_map<uint32, uint32> excess;
+    if (!g_Config.multiboxConsumableKeep)
+        return excess;
+
+    std::unordered_map<uint32, uint32> held;
+    for (Item* item : BagItems(alt))
+        if (IsKeptConsumable(alt, item))
+            held[item->GetEntry()] += item->GetCount();
+    for (auto const& [itemId, count] : held)
+        if (count > g_Config.multiboxConsumableKeep)
+            excess[itemId] = count - g_Config.multiboxConsumableKeep;
+    return excess;
+}
+
 void MultiboxRewardQuest(Player* main, Quest const* quest)
 {
     uint32 const questId = quest->GetQuestId();
@@ -1916,6 +1944,16 @@ void MultiboxVendor(Player* main, Creature* npc)
             alt->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
         }
 
+        // Sell usable consumables beyond ConsumableKeep of each (those with no sell price wait for the guild bank).
+        for (auto const& [itemId, extra] : ConsumableExcess(alt))
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+            if (!proto || !proto->SellPrice)
+                continue;
+            alt->DestroyItemCount(itemId, extra, true);
+            alt->ModifyMoney(static_cast<int32>(proto->SellPrice * extra));
+        }
+
         // Repair.
         alt->DurabilityRepairAll(true, 1.0f, false);
         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
@@ -2000,26 +2038,39 @@ void MultiboxGuildBank(Player* main)
         }
 
         std::unordered_set<uint32> const reagents = ClassReagents(alt);
-        std::vector<ObjectGuid> toDeposit;
+        std::unordered_map<uint32, uint32> keepLeft;  // per kept consumable: how many more stay in its bags
+        std::vector<std::pair<ObjectGuid, uint32>> toDeposit;  // item, amount to split off (0 = the whole stack)
         for (Item* item : BagItems(alt))
         {
             ItemTemplate const* proto = item->GetTemplate();
+
+            // Usable consumables: keep ConsumableKeep of each, deposit the rest.
+            if (IsKeptConsumable(alt, item) && !item->IsSoulBound() && !item->IsBoundAccountWide())
+            {
+                if (!g_Config.multiboxConsumableKeep)
+                    continue;
+                auto [it, fresh] = keepLeft.try_emplace(proto->ItemId, g_Config.multiboxConsumableKeep);
+                uint32 const stays = std::min(it->second, item->GetCount());
+                it->second -= stays;
+                uint32 const extra = item->GetCount() - stays;
+                if (extra)
+                    toDeposit.emplace_back(item->GetGUID(), extra == item->GetCount() ? 0 : extra);
+                continue;
+            }
+
             if (proto->Quality < ITEM_QUALITY_NORMAL || item->IsSoulBound() || item->IsBoundAccountWide() ||
                 proto->Class == ITEM_CLASS_QUEST || proto->Class == ITEM_CLASS_PROJECTILE || proto->Duration ||
                 proto->TotemCategory || item->IsConjuredConsumable() || item->IsRefundable() ||
                 reagents.contains(proto->ItemId))
                 continue;
-            // Consumables it can use (potions, healthstones, food, drink, elixirs, flasks, scrolls) stay with it.
-            if (proto->Class == ITEM_CLASS_CONSUMABLE && alt->CanUseItem(proto) == EQUIP_ERR_OK)
-                continue;
             ItemUsage const usage = UsageFor(alt, proto->ItemId);
             if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
                 continue;
-            toDeposit.push_back(item->GetGUID());
+            toDeposit.emplace_back(item->GetGUID(), 0);
         }
 
         uint32 failed = 0;
-        for (ObjectGuid const& itemGuid : toDeposit)
+        for (auto const& [itemGuid, split] : toDeposit)
         {
             bool stored = false;
             for (uint8 tab : g_Config.multiboxGuildBankTabs)
@@ -2030,8 +2081,10 @@ void MultiboxGuildBank(Player* main)
                     stored = true;
                     break;
                 }
-                guild->SwapItemsWithInventory(alt, false, tab, NULL_SLOT, item->GetBagSlot(), item->GetSlot(), 0);
-                if (!alt->GetItemByGuid(itemGuid))
+                uint32 const before = item->GetCount();
+                guild->SwapItemsWithInventory(alt, false, tab, NULL_SLOT, item->GetBagSlot(), item->GetSlot(), split);
+                Item* after = alt->GetItemByGuid(itemGuid);
+                if (!after || (split && after->GetCount() < before))
                 {
                     stored = true;
                     break;

@@ -164,6 +164,8 @@ AutonomousAltBots.Hub.ErrandStuckSeconds = 20
 #                   quest items, consumables they can use (potions, food, drink, elixirs, flasks, scrolls), and gear
 #                   they would equip; no gold
 #   GuildBankTabs - guild bank tabs to deposit into, tried in order (1 = first tab)
+#   ConsumableKeep - usable consumables (potions, food, drink, elixirs, flasks, scrolls) kept per item; the rest is
+#                   sold at a vendor he opens or deposited at the guild bank (0 = keep all)
 # Bots whisper him when they lack gold, bag space, quest log room, or guild bank room or rights.
 AutonomousAltBots.Multibox.Enable = 0
 AutonomousAltBots.Multibox.Quests = 1
@@ -173,6 +175,7 @@ AutonomousAltBots.Multibox.AmmoTarget = 1000
 AutonomousAltBots.Multibox.ReagentTarget = 20
 AutonomousAltBots.Multibox.GuildBank = 1
 AutonomousAltBots.Multibox.GuildBankTabs = "1,2"
+AutonomousAltBots.Multibox.ConsumableKeep = 20
 
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0
