@@ -179,3 +179,7 @@ AutonomousAltBots.Multibox.ConsumableKeep = 20
 
 # Extra detail in the worldserver log.
 AutonomousAltBots.VerboseLogging = 0
+
+# Items no bot ever sells, destroys, or deposits at the guild bank (comma-separated item IDs; their item usage is KEEP
+# for every bot). Default: the Pocket Portal 900000.
+AutonomousAltBots.KeepItems = "900000"

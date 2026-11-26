@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.14] - 2026-11-26 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- `AutonomousAltBots.KeepItems` (default `"900000"`, the Pocket Portal): bots never sell, destroy, or deposit these items (playerbots fork `TofuAutonomousAlt::SetKeptItems`; their item usage is KEEP). Fixes autonomous alts destroying the Pocket Portal when their bags fill up.
+
 ## [1.0.1-tofu.13] - 2026-11-24 (Tofu Worldview fork, branch tofu)
 
 ### Added

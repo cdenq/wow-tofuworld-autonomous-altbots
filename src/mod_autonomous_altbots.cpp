@@ -367,6 +367,14 @@ void LoadConfig()
     settings.multiboxEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Enable", false);
     settings.multiboxTraining = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Training", true);
     TofuAutonomousAlt::SetSettings(settings);
+
+    // Items no bot ever sells, destroys, or deposits (default: the Pocket Portal).
+    std::vector<uint32> keptItems;
+    std::string const keepList = sConfigMgr->GetOption<std::string>("AutonomousAltBots.KeepItems", "900000");
+    for (std::string_view token : Acore::Tokenize(keepList, ',', false))
+        if (Optional<uint32> itemId = Acore::StringTo<uint32>(token); itemId && *itemId)
+            keptItems.push_back(*itemId);
+    TofuAutonomousAlt::SetKeptItems(keptItems);
 }
 
 void LoadDesiredBots()
@@ -1758,7 +1766,7 @@ std::unordered_map<uint32, uint32> ConsumableExcess(Player* alt)
 
     std::unordered_map<uint32, uint32> held;
     for (Item* item : BagItems(alt))
-        if (IsKeptConsumable(alt, item))
+        if (IsKeptConsumable(alt, item) && !TofuAutonomousAlt::IsKeptItem(item->GetEntry()))
             held[item->GetEntry()] += item->GetCount();
     for (auto const& [itemId, count] : held)
         if (count > g_Config.multiboxConsumableKeep)
@@ -2043,6 +2051,8 @@ void MultiboxGuildBank(Player* main)
         for (Item* item : BagItems(alt))
         {
             ItemTemplate const* proto = item->GetTemplate();
+            if (TofuAutonomousAlt::IsKeptItem(proto->ItemId))
+                continue;
 
             // Usable consumables: keep ConsumableKeep of each, deposit the rest.
             if (IsKeptConsumable(alt, item) && !item->IsSoulBound() && !item->IsBoundAccountWide())
