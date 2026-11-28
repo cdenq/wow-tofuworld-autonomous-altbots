@@ -35,6 +35,8 @@
  * - Restock trips (Hub.Enable = 1): when bags fill up, gear wears out, ammo runs low, a tool is missing, a forge or
  *   anvil craft is ready, or a profession rank is waiting, a solo alt or a whole party teleports to the guild hub,
  *   each member does its own errands there (mod-playerbots "tofu hub"), and they teleport back together.
+ * - Action bars (KeepActionBars = 1): a character played as a bot gets back, at the next real login, the bars a real
+ *   player left on it (every spec), each spell at its current rank (table tofu_autoalt_action_snapshot).
  */
 
 #include "AccountMgr.h"
@@ -93,7 +95,7 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr char SETTING_SOURCE[] = "mod_autonomous_altbots";
-constexpr char MODULE_VERSION[] = "1.0.1-tofu.5";
+constexpr char MODULE_VERSION[] = "1.0.1-tofu.15";
 constexpr uint32 SETTING_ENABLED = 0;
 constexpr uint32 STOP_WATCH_DURATION_MS = 30000;
 
@@ -107,6 +109,7 @@ struct AutonomousAltConfig
     bool grind = true;
     bool newRpg = true;
     bool verboseLogging = false;
+    bool keepActionBars = false;  // action bars of a character are restored when a real player takes it back
 
     // Challenge modes: indexes in the character's player settings under challengeSource (mod-challenge-modes), -1 = off.
     std::string challengeSource = "mod-challenge-modes";
@@ -252,6 +255,7 @@ void LoadConfig()
     g_Config.grind = sConfigMgr->GetOption<bool>("AutonomousAltBots.Strategy.Grind", true);
     g_Config.newRpg = sConfigMgr->GetOption<bool>("AutonomousAltBots.Strategy.NewRpg", true);
     g_Config.verboseLogging = sConfigMgr->GetOption<bool>("AutonomousAltBots.VerboseLogging", false);
+    g_Config.keepActionBars = sConfigMgr->GetOption<bool>("AutonomousAltBots.KeepActionBars", false);
 
     g_Config.challengeSource =
         sConfigMgr->GetOption<std::string>("AutonomousAltBots.Challenge.SettingSource", "mod-challenge-modes");
@@ -503,6 +507,173 @@ Player* FindConnectedCharacter(ObjectGuid guid)
 bool IsPlayerbot(Player* player)
 {
     return player && GET_PLAYERBOT_AI(player) != nullptr;
+}
+
+// Action bars (KeepActionBars). A bot has no game client, so when it learns a new rank the core's "superseded spell"
+// packet goes nowhere and its saved buttons keep the old rank, which a returning player's client no longer knows and
+// shows as empty; bots also change the shaman totem bar. So the bars are saved (every spec, from character_action)
+// when a non-random character logs in as a bot and no saved copy exists yet, and put back when a real player logs in
+// on it, each spell moved to the rank the character now has. The saved copy is deleted at that player's next save.
+std::mutex g_RestoredBarsMutex;
+std::unordered_set<ObjectGuid::LowType> g_RestoredBars;  // restored this session; the copy goes at the next save
+
+bool IsKnownInSpec(Player* player, uint32 spellId, uint8 spec, bool activeOnly)
+{
+    PlayerSpellMap const& spells = player->GetSpellMap();
+    auto itr = spells.find(spellId);
+    if (itr == spells.end() || !itr->second || itr->second->State == PLAYERSPELL_REMOVED)
+        return false;
+
+    if (activeOnly && !itr->second->Active)
+        return false;
+
+    return itr->second->IsInSpec(spec);
+}
+
+// The button's action for this spec now: a spell becomes the character's current rank of it; 0 drops the button
+// (a spell the character no longer knows in that spec, which the core would drop at the next load anyway).
+uint32 MapActionToCurrentRank(Player* player, uint32 action, uint8 type, uint8 spec)
+{
+    if (type != ACTION_BUTTON_SPELL)
+        return action;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(action);
+    if (!spellInfo)
+        return 0;
+
+    if (IsKnownInSpec(player, action, spec, true))
+        return action;
+
+    if (spellInfo->IsRanked() && !spellInfo->IsStackableWithRanks())
+        for (uint32 rank = sSpellMgr->GetLastSpellInChain(action); rank; rank = sSpellMgr->GetPrevSpellInChain(rank))
+            if (IsKnownInSpec(player, rank, spec, true))
+                return rank;
+
+    return IsKnownInSpec(player, action, spec, false) ? action : 0;
+}
+
+// World thread, at a bot's login. Only the first bot login after a real player played the character saves the bars.
+void SaveActionBarsForBot(Player* bot)
+{
+    if (!g_Config.keepActionBars || !bot || !bot->GetSession())
+        return;
+
+    ObjectGuid::LowType const lowGuid = bot->GetGUID().GetCounter();
+    if (sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()) ||
+        sRandomPlayerbotMgr.IsAddclassBot(lowGuid))
+        return;
+
+    {
+        std::lock_guard lock(g_RestoredBarsMutex);
+        g_RestoredBars.erase(lowGuid);
+    }
+
+    CharacterDatabase.Execute(
+        "INSERT IGNORE INTO tofu_autoalt_action_snapshot (guid, spec, button, action, type) "
+        "SELECT guid, spec, button, action, type FROM character_action WHERE guid = {} "
+        "AND NOT EXISTS (SELECT 1 FROM tofu_autoalt_action_snapshot s WHERE s.guid = {})",
+        lowGuid, lowGuid);
+}
+
+// World thread, at a real player's login (after the core sent the stored buttons; they are sent again if changed).
+void RestoreActionBarsForPlayer(Player* player)
+{
+    if (!g_Config.keepActionBars || !player)
+        return;
+
+    ObjectGuid::LowType const lowGuid = player->GetGUID().GetCounter();
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT spec, button, action, type FROM tofu_autoalt_action_snapshot WHERE guid = {}", lowGuid);
+    if (!result)
+        return;
+
+    // spec -> button -> (action, type)
+    std::map<uint8, std::map<uint8, std::pair<uint32, uint8>>> saved;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint8 const spec = fields[0].Get<uint8>();
+        uint8 const button = fields[1].Get<uint8>();
+        if (spec < MAX_TALENT_SPECS && button < MAX_ACTION_BUTTONS)
+            saved[spec][button] = { fields[2].Get<uint32>(), fields[3].Get<uint8>() };
+    } while (result->NextRow());
+
+    // Active spec: the buttons in memory, saved by the core at the next save.
+    uint8 const activeSpec = player->GetActiveSpec();
+    std::map<uint8, std::pair<uint32, uint8>> const& wanted = saved[activeSpec];
+    uint32 changed = 0;
+    for (uint8 button = 0; button < MAX_ACTION_BUTTONS; ++button)
+    {
+        ActionButton const* current = player->GetActionButton(button);
+        uint32 action = 0;
+        uint8 type = 0;
+        auto itr = wanted.find(button);
+        if (itr != wanted.end())
+        {
+            type = itr->second.second;
+            action = MapActionToCurrentRank(player, itr->second.first, type, activeSpec);
+        }
+
+        if (action)
+        {
+            if (current && current->GetAction() == action && uint8(current->GetType()) == type)
+                continue;
+
+            if (player->addActionButton(button, action, type))
+            {
+                ++changed;
+                continue;
+            }
+        }
+
+        if (current)
+        {
+            player->removeActionButton(button);
+            ++changed;
+        }
+    }
+
+    // Other spec: its rows in the database, which the core loads at the next spec switch.
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    for (uint8 spec = 0; spec < player->GetSpecsCount() && spec < MAX_TALENT_SPECS; ++spec)
+    {
+        if (spec == activeSpec)
+            continue;
+
+        trans->Append("DELETE FROM character_action WHERE guid = {} AND spec = {}", lowGuid, spec);
+        for (auto const& [button, entry] : saved[spec])
+            if (uint32 action = MapActionToCurrentRank(player, entry.first, entry.second, spec))
+                trans->Append("INSERT INTO character_action (guid, spec, button, action, type) VALUES ({}, {}, {}, {}, {})",
+                              lowGuid, spec, button, action, entry.second);
+    }
+    CharacterDatabase.CommitTransaction(trans);
+
+    if (changed)
+        player->SendActionButtons(1);
+
+    {
+        std::lock_guard lock(g_RestoredBarsMutex);
+        g_RestoredBars.insert(lowGuid);
+    }
+
+    LOG_INFO("module", "mod-autonomous-altbots: restored the action bars of {} ({} buttons changed in the active spec)",
+             player->GetName(), changed);
+}
+
+// Any thread (saves run on map threads too). The bars are now saved by the core, so the copy is no longer needed.
+void DropActionBarCopyAfterSave(Player* player)
+{
+    if (!player || !player->GetSession() || player->GetSession()->IsHeadless())
+        return;
+
+    ObjectGuid::LowType const lowGuid = player->GetGUID().GetCounter();
+    {
+        std::lock_guard lock(g_RestoredBarsMutex);
+        if (!g_RestoredBars.erase(lowGuid))
+            return;
+    }
+
+    CharacterDatabase.Execute("DELETE FROM tofu_autoalt_action_snapshot WHERE guid = {}", lowGuid);
 }
 
 // A real player is a game client with a character in the world (bot sessions never count; neither does a client
@@ -2386,8 +2557,26 @@ public:
     AutonomousAltBotsPlayerScript()
         : PlayerScript("AutonomousAltBotsPlayerScript",
                        { PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_CAN_GROUP_INVITE, PLAYERHOOK_ON_DELETE_FROM_DB,
-                         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_QUEST_ABANDON })
+                         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_QUEST_ABANDON, PLAYERHOOK_ON_LOGIN,
+                         PLAYERHOOK_ON_SAVE })
     {
+    }
+
+    // World thread. A bot session has no socket (headless); a game client's session has one.
+    void OnPlayerLogin(Player* player) override
+    {
+        if (!player || !player->GetSession())
+            return;
+
+        if (player->GetSession()->IsHeadless())
+            SaveActionBarsForBot(player);
+        else
+            RestoreActionBarsForPlayer(player);
+    }
+
+    void OnPlayerSave(Player* player) override
+    {
+        DropActionBarCopyAfterSave(player);
     }
 
     // Map threads: the multibox main's quest changes are queued for the world thread.
@@ -2430,10 +2619,11 @@ public:
         return true;
     }
 
-    // Character GUIDs are reused after a delete, so the party row goes with the character.
+    // Character GUIDs are reused after a delete, so the party row and the saved action bars go with the character.
     void OnPlayerDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid) override
     {
         trans->Append("DELETE FROM tofu_autoalt_party_member WHERE guid = {}", guid);
+        trans->Append("DELETE FROM tofu_autoalt_action_snapshot WHERE guid = {}", guid);
         RemovePartyMember(guid);
     }
 

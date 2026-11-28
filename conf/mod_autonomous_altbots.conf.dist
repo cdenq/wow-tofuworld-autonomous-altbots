@@ -183,3 +183,11 @@ AutonomousAltBots.VerboseLogging = 0
 # Items no bot ever sells, destroys, or deposits at the guild bank (comma-separated item IDs; their item usage is KEEP
 # for every bot). Default: the Pocket Portal 900000.
 AutonomousAltBots.KeepItems = "900000"
+
+# Action bars of characters played as bots (every non-random altbot, autonomous or added with .playerbots bot add).
+# A bot has no game client, so its saved buttons keep the old rank of every spell it ranks up (which the player's client
+# then shows as empty), and bots change the shaman totem bar. With 1, the bars of every spec are saved at the first bot
+# login after a real player played the character, and put back when a real player logs in on it again, each spell at
+# the character's current rank. Buttons of spells the character no longer knows in that spec are dropped.
+# Needs the module SQL mod_autonomous_altbots_action_snapshot.sql (table tofu_autoalt_action_snapshot).
+AutonomousAltBots.KeepActionBars = 0

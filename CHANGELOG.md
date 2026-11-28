@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.15] - 2026-11-28 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- `AutonomousAltBots.KeepActionBars` (default 0): a character played as a bot (any non-random altbot) gets back the action bars a real player left on it, for every spec, with each spell at its current rank. Saved from `character_action` at the first bot login after a real player played it (table `tofu_autoalt_action_snapshot`, module SQL `mod_autonomous_altbots_action_snapshot.sql`), restored at the next real login, and deleted at that player's next save. Fixes spells a bot ranked up showing as empty buttons, and bots changing the shaman totem bar.
+
 ## [1.0.1-tofu.14] - 2026-11-26 (Tofu Worldview fork, branch tofu)
 
 ### Added
