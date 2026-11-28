@@ -146,6 +146,19 @@ AutonomousAltBots.Hub.MaxMinutes = 5
 AutonomousAltBots.Hub.MinIntervalMinutes = 20
 AutonomousAltBots.Hub.ErrandStuckSeconds = 20
 
+# Leaving the guild hub. An alt that logs in at the hub, or stands idle there (no restock trip under way) for
+# IdleSeconds, teleports out: to the point it left for its last hub trip or dungeon queue (kept across logouts and
+# restarts), else to the NPC of a quest in its log (a completed quest's ender first, then the quest nearest its level),
+# else to a zone for its level. Hardcore alts never take the level-zone teleport, and skip quests more than
+# Hardcore.MaxLevelsAbove levels above them. Party followers are brought along by their leader. Alts grouped with a real
+# player are left alone. With Enable = 0, an alt found at the hub is sent to its homebind, as before.
+#   Enable       - 1 = on
+#   IdleSeconds  - how long an alt may stand at the hub with nothing to do (a login at the hub leaves at once)
+#   QuestTarget  - 1 = use quest NPCs; 0 = return point, then level zone only
+AutonomousAltBots.Hub.Escape.Enable = 0
+AutonomousAltBots.Hub.Escape.IdleSeconds = 60
+AutonomousAltBots.Hub.Escape.QuestTarget = 1
+
 # Multibox: a real player's own altbots (enrolled or not), in his group, follow his turn-ins. Bots get his quests by
 # sharing (for example Jamba's auto-share; the playerbots fork accepts shares and gives the starter item of an
 # item-started quest). When he is rewarded for a quest, each bot that has it in its log is completed and rewarded at

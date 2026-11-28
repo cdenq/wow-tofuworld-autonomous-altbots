@@ -35,6 +35,10 @@
  * - Restock trips (Hub.Enable = 1): when bags fill up, gear wears out, ammo runs low, a tool is missing, a forge or
  *   anvil craft is ready, or a profession rank is waiting, a solo alt or a whole party teleports to the guild hub,
  *   each member does its own errands there (mod-playerbots "tofu hub"), and they teleport back together.
+ * - Leaving the hub (Hub.Escape.Enable = 1): an alt that logs in at the guild hub, or stands idle there for IdleSeconds
+ *   (its homebind may be the hub), teleports to its saved return point (table tofu_autoalt_return_point, written when
+ *   a hub trip or a dungeon queue starts), else to an NPC of a quest in its log, else (not Hardcore) to a zone for its
+ *   level. Party followers come along with their leader.
  * - Action bars (KeepActionBars = 1): a character played as a bot gets back, at the next real login, the bars a real
  *   player left on it (every spec), each spell at its current rank (table tofu_autoalt_action_snapshot).
  */
@@ -82,6 +86,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <tuple>
 #include <mutex>
@@ -95,7 +101,7 @@ using namespace Acore::ChatCommands;
 namespace
 {
 constexpr char SETTING_SOURCE[] = "mod_autonomous_altbots";
-constexpr char MODULE_VERSION[] = "1.0.1-tofu.15";
+constexpr char MODULE_VERSION[] = "1.0.1-tofu.16";
 constexpr uint32 SETTING_ENABLED = 0;
 constexpr uint32 STOP_WATCH_DURATION_MS = 30000;
 
@@ -142,6 +148,11 @@ struct AutonomousAltConfig
     bool hubEnable = false;
     uint32 hubMaxMs = 5 * MINUTE * IN_MILLISECONDS;
     uint32 hubMinIntervalMs = 20 * MINUTE * IN_MILLISECONDS;
+
+    // Leaving the guild hub: an alt there with nothing to do teleports back to its quests.
+    bool hubEscapeEnable = false;
+    uint32 hubEscapeIdleMs = 60 * IN_MILLISECONDS;
+    bool hubEscapeQuestTarget = true;
 
     // Multibox: a real player's own altbots in his group copy his quests, training, and vendor visits.
     bool multiboxEnable = false;
@@ -231,6 +242,13 @@ std::unordered_map<ObjectGuid::LowType, ObjectGuid::LowType> g_PartyRole;
 std::unordered_map<uint32, PartyRun> g_PartyRuns;
 std::unordered_map<ObjectGuid::LowType, SoloHub> g_SoloHub;
 std::unordered_set<ObjectGuid::LowType> g_PartyBusy;  // members of a party that is not Open this check
+
+// Leaving the guild hub (world thread). Return points mirror tofu_autoalt_return_point, so a trip cut short by a
+// logout or a restart still knows where the alt was questing.
+std::unordered_map<ObjectGuid::LowType, ReturnPoint> g_ReturnPoints;
+std::unordered_map<ObjectGuid::LowType, uint32> g_HubIdleSince; // first check it was seen idle at the hub
+std::unordered_set<ObjectGuid::LowType> g_RescueCheckedThisLogin; // had its first stranded check since login
+std::unordered_set<ObjectGuid::LowType> g_HubStayLogged; // "stays at the hub" logged this login
 
 // Hardcore alts that died since the last update (filled from map threads, handled on the world thread).
 std::mutex g_PendingDeathsMutex;
@@ -325,6 +343,10 @@ void LoadConfig()
     g_Config.hubMaxMs = sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.MaxMinutes", 5) * MINUTE * IN_MILLISECONDS;
     g_Config.hubMinIntervalMs =
         sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.MinIntervalMinutes", 20) * MINUTE * IN_MILLISECONDS;
+    g_Config.hubEscapeEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Hub.Escape.Enable", false);
+    g_Config.hubEscapeIdleMs =
+        sConfigMgr->GetOption<uint32>("AutonomousAltBots.Hub.Escape.IdleSeconds", 60) * IN_MILLISECONDS;
+    g_Config.hubEscapeQuestTarget = sConfigMgr->GetOption<bool>("AutonomousAltBots.Hub.Escape.QuestTarget", true);
 
     g_Config.multiboxEnable = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Enable", false);
     g_Config.multiboxQuests = sConfigMgr->GetOption<bool>("AutonomousAltBots.Multibox.Quests", true);
@@ -1232,9 +1254,12 @@ void StartHubVisit(Player* bot)
     bot->TeleportTo(hub.mapId, hub.x, hub.y, hub.z, hub.o);
 }
 
+void ClearReturnPoint(ObjectGuid::LowType guid);
+
 void EndHubVisit(Player* bot, ReturnPoint const& back)
 {
     TofuAutonomousAlt::SetHubVisit(bot->GetGUID().GetCounter(), false);
+    ClearReturnPoint(bot->GetGUID().GetCounter());
     if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
         if (botAI->HasStrategy("tofu hub", BOT_STATE_NON_COMBAT))
             botAI->ChangeStrategy("-tofu hub", BOT_STATE_NON_COMBAT);
@@ -1258,6 +1283,218 @@ bool InHubArea(Player* bot)
 {
     TofuAutonomousAlt::HubSettings const hub = TofuAutonomousAlt::GetHubSettings();
     return bot->GetMapId() == hub.mapId && bot->GetExactDist(hub.x, hub.y, hub.z) <= hub.radius;
+}
+
+bool PointInHubArea(uint32 mapId, float x, float y, float z)
+{
+    TofuAutonomousAlt::HubSettings const hub = TofuAutonomousAlt::GetHubSettings();
+    if (mapId != hub.mapId)
+        return false;
+    float const dx = x - hub.x;
+    float const dy = y - hub.y;
+    float const dz = z - hub.z;
+    return dx * dx + dy * dy + dz * dz <= hub.radius * hub.radius;
+}
+
+bool IsOpenWorldMap(uint32 mapId)
+{
+    MapEntry const* entry = sMapStore.LookupEntry(mapId);
+    return entry && !entry->Instanceable();
+}
+
+// ---- Leaving the guild hub ----
+
+void SaveReturnPoint(ObjectGuid::LowType guid, ReturnPoint const& point)
+{
+    if (!point.set || !IsOpenWorldMap(point.mapId) || PointInHubArea(point.mapId, point.x, point.y, point.z))
+        return;
+
+    g_ReturnPoints[guid] = point;
+    CharacterDatabase.Execute(
+        "REPLACE INTO tofu_autoalt_return_point (guid, map, x, y, z, o) VALUES ({}, {}, {}, {}, {}, {})", guid,
+        point.mapId, point.x, point.y, point.z, point.o);
+}
+
+void ClearReturnPoint(ObjectGuid::LowType guid)
+{
+    if (g_ReturnPoints.erase(guid))
+        CharacterDatabase.Execute("DELETE FROM tofu_autoalt_return_point WHERE guid = {}", guid);
+}
+
+void LoadReturnPoints()
+{
+    g_ReturnPoints.clear();
+    if (QueryResult result = CharacterDatabase.Query("SELECT guid, map, x, y, z, o FROM tofu_autoalt_return_point"))
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            ReturnPoint point;
+            point.mapId = fields[1].Get<uint16>();
+            point.x = fields[2].Get<float>();
+            point.y = fields[3].Get<float>();
+            point.z = fields[4].Get<float>();
+            point.o = fields[5].Get<float>();
+            point.set = true;
+            g_ReturnPoints[fields[0].Get<ObjectGuid::LowType>()] = point;
+        } while (result->NextRow());
+    }
+    LOG_INFO("module", "mod-autonomous-altbots: loaded {} saved return point(s)", g_ReturnPoints.size());
+}
+
+// Quest NPCs: for each quest, the creatures that start and end it, and for each of those creatures one open-world
+// spawn in the normal phase outside the hub. Built once (the first time it is needed after startup).
+struct SpawnPoint
+{
+    uint32 mapId = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float o = 0.0f;
+};
+
+std::unordered_map<uint32, std::vector<uint32>> g_QuestEnders; // quest id -> creature entries
+std::unordered_map<uint32, std::vector<uint32>> g_QuestStarters; // quest id -> creature entries
+std::unordered_map<uint32, SpawnPoint> g_QuestNpcSpawn; // creature entry -> a spawn
+bool g_QuestIndexBuilt = false;
+
+void BuildQuestNpcIndex()
+{
+    if (g_QuestIndexBuilt)
+        return;
+    g_QuestIndexBuilt = true;
+
+    std::unordered_set<uint32> wanted;
+    for (auto const& [entry, questId] : *sObjectMgr->GetCreatureQuestInvolvedRelationMap())
+    {
+        g_QuestEnders[questId].push_back(entry);
+        wanted.insert(entry);
+    }
+    for (auto const& [entry, questId] : *sObjectMgr->GetCreatureQuestRelationMap())
+    {
+        g_QuestStarters[questId].push_back(entry);
+        wanted.insert(entry);
+    }
+
+    for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+    {
+        if (!wanted.contains(data.id) || g_QuestNpcSpawn.contains(data.id))
+            continue;
+        if (!(data.phaseMask & PHASEMASK_NORMAL) || !IsOpenWorldMap(data.mapid))
+            continue;
+        if (PointInHubArea(data.mapid, data.posX, data.posY, data.posZ))
+            continue;
+
+        g_QuestNpcSpawn[data.id] = { data.mapid, data.posX, data.posY, data.posZ, data.orientation };
+    }
+
+    LOG_INFO("module", "mod-autonomous-altbots: quest NPC index: {} quest(s) with an ender, {} NPC spawn(s)",
+             g_QuestEnders.size(), g_QuestNpcSpawn.size());
+}
+
+// The quest NPC to go to: a quest in the log that is complete (its ender) before one that is not (its ender, else its
+// starter), nearest the alt's level first. Hostile NPCs and quests too far above a Hardcore alt are skipped.
+bool ChooseQuestTarget(Player* bot, bool hardcore, SpawnPoint& target, Quest const*& chosen)
+{
+    BuildQuestNpcIndex();
+
+    FactionTemplateEntry const* botFaction = bot->GetFactionTemplateEntry();
+    int32 const botLevel = static_cast<int32>(bot->GetLevel());
+    int32 const maxAbove = static_cast<int32>(TofuAutonomousAlt::GetSettings().hardcoreMaxLevelsAbove);
+    int32 bestScore = std::numeric_limits<int32>::max();
+    chosen = nullptr;
+
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 const questId = bot->GetQuestSlotQuestId(slot);
+        Quest const* quest = questId ? sObjectMgr->GetQuestTemplate(questId) : nullptr;
+        if (!quest)
+            continue;
+
+        QuestStatus const status = bot->GetQuestStatus(questId);
+        if (status != QUEST_STATUS_COMPLETE && status != QUEST_STATUS_INCOMPLETE)
+            continue;
+
+        int32 const level = quest->GetQuestLevel() > 0 ? quest->GetQuestLevel() : botLevel;
+        if (hardcore && level > botLevel + maxAbove)
+            continue;
+
+        std::vector<uint32> npcs;
+        if (auto const itr = g_QuestEnders.find(questId); itr != g_QuestEnders.end())
+            npcs = itr->second;
+        if (status == QUEST_STATUS_INCOMPLETE)
+            if (auto const itr = g_QuestStarters.find(questId); itr != g_QuestStarters.end())
+                npcs.insert(npcs.end(), itr->second.begin(), itr->second.end());
+
+        int32 const score = (status == QUEST_STATUS_COMPLETE ? 0 : 1000) + std::abs(level - botLevel);
+        if (score >= bestScore)
+            continue;
+
+        for (uint32 entry : npcs)
+        {
+            auto const spawn = g_QuestNpcSpawn.find(entry);
+            if (spawn == g_QuestNpcSpawn.end())
+                continue;
+
+            CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(entry);
+            if (!creature)
+                continue;
+
+            FactionTemplateEntry const* faction = sFactionTemplateStore.LookupEntry(creature->faction);
+            if (faction && botFaction && faction->IsHostileTo(*botFaction))
+                continue;
+
+            target = spawn->second;
+            chosen = quest;
+            bestScore = score;
+            break;
+        }
+    }
+
+    return chosen != nullptr;
+}
+
+// Teleports an alt out of the hub: to its saved return point, else to an NPC of a quest in its log, else (not Hardcore)
+// to a zone for its level. Returns whether it left.
+bool LeaveHub(Player* bot, char const* why)
+{
+    ObjectGuid::LowType const guid = bot->GetGUID().GetCounter();
+    bool const hardcore = GetChallengeState(bot).hardcore;
+
+    if (auto const itr = g_ReturnPoints.find(guid); itr != g_ReturnPoints.end())
+    {
+        ReturnPoint const back = itr->second;
+        ClearReturnPoint(guid);
+        if (IsOpenWorldMap(back.mapId) && bot->TeleportTo(back.mapId, back.x, back.y, back.z, back.o))
+        {
+            LOG_INFO("module", "mod-autonomous-altbots: {} {}; left the hub (return point)", bot->GetName(), why);
+            return true;
+        }
+    }
+
+    SpawnPoint target;
+    Quest const* quest = nullptr;
+    if (g_Config.hubEscapeQuestTarget && ChooseQuestTarget(bot, hardcore, target, quest) &&
+        bot->TeleportTo(target.mapId, target.x, target.y, target.z, target.o))
+    {
+        LOG_INFO("module", "mod-autonomous-altbots: {} {}; left the hub (quest {} \"{}\")", bot->GetName(), why,
+                 quest->GetQuestId(), quest->GetTitle());
+        return true;
+    }
+
+    if (!hardcore)
+    {
+        sRandomPlayerbotMgr.TofuTeleportForLevel(bot);
+        LOG_INFO("module", "mod-autonomous-altbots: {} {}; left the hub (level zone)", bot->GetName(), why);
+        return true;
+    }
+
+    if (g_HubStayLogged.insert(guid).second)
+        LOG_INFO("module",
+                 "mod-autonomous-altbots: {} {}; stays at the hub (Hardcore: no return point, no quest NPC to go to, and "
+                 "no level-zone teleport)",
+                 bot->GetName(), why);
+    return false;
 }
 
 // Online members of a party that play as bots and are not with a real player.
@@ -1476,8 +1713,14 @@ void EndDungeonRun(Party& party, PartyRun& run, bool cleared, char const* why, u
 void FinishLeaving(Party& party, PartyRun& run, uint32 now)
 {
     for (Player* member : OnlinePartyBots(party))
+    {
         if (member->GetGroup())
             member->RemoveFromGroup();  // the fill bots are released when the leader leaves; the party regroups
+
+        // Back at the dungeon entrance: the saved point is no longer needed. At the hub (homebind): it takes them back.
+        if (!InHubArea(member) && !(member->GetMap() && member->GetMap()->IsDungeon()))
+            ClearReturnPoint(member->GetGUID().GetCounter());
+    }
 
     ClearRunFlags(party.members, run.leader);
     run.nextDungeonAt = now + (run.cleared ? g_Config.dungeonClearedCooldownMs : g_Config.dungeonRetryCooldownMs);
@@ -1539,11 +1782,21 @@ void ProcessPartyRuns(bool active)
                     run.memberCount = static_cast<uint32>(grouped.size());
                     run.status = "restocking at the guild hub";
                     for (Player* member : grouped)
+                    {
+                        SaveReturnPoint(member->GetGUID().GetCounter(), run.back);
                         StartHubVisit(member);
+                    }
                     break;
                 }
 
-                if (!TryQueueDungeon(party, run, leader, grouped, now) && run.status.rfind("questing", 0) != 0)
+                if (TryQueueDungeon(party, run, leader, grouped, now))
+                {
+                    // Where to go back to if the run ends at the homebind (the hub) or a logout cuts it short.
+                    ReturnPoint const back = PointOf(leader);
+                    for (Player* member : grouped)
+                        SaveReturnPoint(member->GetGUID().GetCounter(), back);
+                }
+                else if (run.status.rfind("questing", 0) != 0)
                     run.status = "questing";
                 break;
             }
@@ -1554,6 +1807,8 @@ void ProcessPartyRuns(bool active)
                 if (!leader || !group)
                 {
                     ClearRunFlags(party.members, run.leader);
+                    for (ObjectGuid::LowType member : party.members)
+                        ClearReturnPoint(member);
                     run.phase = PartyPhase::Open;
                     run.nextDungeonAt = now + 10 * MINUTE * IN_MILLISECONDS;
                     run.status = "questing (the queue ended: the leader left)";
@@ -1582,6 +1837,8 @@ void ProcessPartyRuns(bool active)
                         sLFGMgr->LeaveAllLfgQueues(leader->GetGUID(), true, group->GetGUID());
                     }
                     ClearRunFlags(party.members, run.leader);
+                    for (ObjectGuid::LowType member : party.members)
+                        ClearReturnPoint(member);
                     run.phase = PartyPhase::Open;
                     run.nextDungeonAt = now + 10 * MINUTE * IN_MILLISECONDS;
                     run.status = timedOut ? "questing (the queue timed out)" : "questing (the queue ended)";
@@ -1685,26 +1942,73 @@ void ProcessSoloHubs(bool active)
             continue;
 
         hub.back = PointOf(bot);
+        SaveReturnPoint(lowGuid, hub.back);
         hub.active = true;
         hub.since = now;
         StartHubVisit(bot);
     }
 }
 
-// An alt that logged in at the hub or inside a dungeon with nothing to do there (a trip or run cut short by a logout)
-// goes home.
+// An alt that logged in at the hub or inside a dungeon with nothing to do there (a trip or run cut short by a logout),
+// or that has stood idle at the hub (its homebind may be the hub), goes back to its quests (Hub.Escape.Enable) or,
+// with that off, home.
 void RescueStranded(Player* bot)
 {
     ObjectGuid::LowType const guid = bot->GetGUID().GetCounter();
-    if (!ReadyToTravel(bot) && !(bot->GetMap() && bot->GetMap()->IsDungeon() && bot->IsAlive()))
+    bool const firstCheck = g_RescueCheckedThisLogin.insert(guid).second;
+    bool const hubKnown = g_Config.hubEnable || g_Config.hubEscapeEnable;
+    bool const inDungeon = bot->GetMap() && bot->GetMap()->IsDungeon();
+
+    if (!hubKnown || !InHubArea(bot))
+        g_HubIdleSince.erase(guid);
+
+    if (!ReadyToTravel(bot) && !(inDungeon && bot->IsAlive()))
         return;
     if (bot->IsBeingTeleported() || bot->IsInCombat() || GroupedWithRealPlayer(bot))
         return;
     if (TofuAutonomousAlt::IsHubVisitActive(guid) || g_PartyBusy.contains(guid))
         return;
 
-    if ((g_Config.hubEnable && InHubArea(bot)) || (bot->GetMap() && bot->GetMap()->IsDungeon()))
+    if (inDungeon)
+    {
+        auto const itr = g_ReturnPoints.find(guid);
+        if (g_Config.hubEscapeEnable && itr != g_ReturnPoints.end())
+        {
+            ReturnPoint const back = itr->second;
+            ClearReturnPoint(guid);
+            if (bot->TeleportTo(back.mapId, back.x, back.y, back.z, back.o))
+            {
+                LOG_INFO("module", "mod-autonomous-altbots: {} was left in a dungeon; went to its return point",
+                         bot->GetName());
+                return;
+            }
+        }
         TeleportHome(bot);
+        return;
+    }
+
+    if (!hubKnown || !InHubArea(bot))
+        return;
+
+    if (!g_Config.hubEscapeEnable)
+    {
+        if (g_Config.hubEnable)
+            TeleportHome(bot);
+        return;
+    }
+
+    // A party follower is brought along by its leader (RegroupFollower).
+    auto const role = g_PartyRole.find(guid);
+    if (role != g_PartyRole.end() && role->second != guid)
+        return;
+
+    uint32 const now = getMSTime();
+    auto const [idle, fresh] = g_HubIdleSince.try_emplace(guid, now);
+    if (!firstCheck && (fresh || getMSTimeDiff(idle->second, now) < g_Config.hubEscapeIdleMs))
+        return;
+
+    idle->second = now;  // a failed attempt is retried after another IdleSeconds
+    LeaveHub(bot, firstCheck ? "logged in at the hub" : "was idle at the hub");
 }
 
 
@@ -2414,6 +2718,9 @@ public:
     {
         LoadDesiredBots();
         LoadParties();
+        LoadReturnPoints();
+        if (g_Config.hubEscapeEnable && g_Config.hubEscapeQuestTarget)
+            BuildQuestNpcIndex();
         g_StartupElapsed = 0;
         g_CheckElapsed = 0;
         g_NoPlayerElapsed = 0;
@@ -2466,6 +2773,9 @@ public:
             if (!connected)
             {
                 g_CaughtUpThisLogin.erase(lowGuid);
+                g_RescueCheckedThisLogin.erase(lowGuid);
+                g_HubIdleSince.erase(lowGuid);
+                g_HubStayLogged.erase(lowGuid);
                 TofuAutonomousAlt::ClearBotState(lowGuid);
 
                 // Never log in while no real player is in the world.
@@ -2624,6 +2934,8 @@ public:
     {
         trans->Append("DELETE FROM tofu_autoalt_party_member WHERE guid = {}", guid);
         trans->Append("DELETE FROM tofu_autoalt_action_snapshot WHERE guid = {}", guid);
+        trans->Append("DELETE FROM tofu_autoalt_return_point WHERE guid = {}", guid);
+        g_ReturnPoints.erase(guid);
         RemovePartyMember(guid);
     }
 

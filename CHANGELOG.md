@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The format follows Keep a Changelog and the project uses
 Semantic Versioning.
 
+## [1.0.1-tofu.16] - 2026-11-28 (Tofu Worldview fork, branch tofu)
+
+### Added
+
+- `AutonomousAltBots.Hub.Escape.Enable` (default 0), `.IdleSeconds` (60), `.QuestTarget` (1): an alt that logs in at the guild hub, or stands idle there for IdleSeconds, teleports back to its quests: the point it left for its last hub trip or dungeon queue (table `tofu_autoalt_return_point`, module SQL `mod_autonomous_altbots_return_points.sql`, kept across logouts and restarts), else the spawn of a quest NPC from its log (a completed quest's ender first, then the quest nearest its level; hostile NPCs skipped), else a zone for its level (`TofuTeleportForLevel`; never for Hardcore alts, which also skip quests above `Hardcore.MaxLevelsAbove`). Party followers come with their leader; alts grouped with a real player are left alone. Log line `mod-autonomous-altbots: <name> <logged in at|was idle at> the hub; left the hub (<return point|quest <id> "<title>"|level zone>)`.
+
+### Fixed
+
+- An alt whose homebind is the guild hub no longer stays there after a hub trip or dungeon run is cut short by a logout or restart (it was sent "home" to the hub again), when `Hub.Escape.Enable = 1`.
+
 ## [1.0.1-tofu.15] - 2026-11-28 (Tofu Worldview fork, branch tofu)
 
 ### Added
